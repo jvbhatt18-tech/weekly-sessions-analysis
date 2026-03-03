@@ -81,10 +81,17 @@ def generate_retention_curve(df, join_col, leave_col):
     return df_tl, peak
 
 def parse_attendee_smart(uploaded_file):
-    metrics = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "title": "Unknown", "date": date.today(), "timeline": pd.DataFrame(), "end_count": 0, "stickiness": 0}
+    metrics = {
+        "trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, 
+        "title": "Unknown", "date": date.today(), 
+        "timeline": pd.DataFrame(), "end_count": 0, "stickiness": 0,
+        "is_simulive": False
+    }
     try:
         content = uploaded_file.getvalue().decode("utf-8", errors='replace')
         lines = content.splitlines()
+        
+        # 1. Metadata
         for line in lines[:5]:
             if "Topic" in line and "Start Time" in line:
                 try:
@@ -93,44 +100,77 @@ def parse_attendee_smart(uploaded_file):
                     metrics["date"] = pd.to_datetime(str(row[2]).split()[0]).date()
                 except: pass
                 break
+        
+        # 2. Check for Simulive (Presenter at bottom)
+        # Scan last 20 lines for "Other Attended" and "Presenter"
+        tail_lines = lines[-20:] if len(lines) > 20 else lines
+        for line in tail_lines:
+            if "Presenter" in line:
+                metrics["is_simulive"] = True
+                # Extract duration from Presenter row if possible
+                try:
+                    parts = next(pd.read_csv(io.StringIO(line), header=None).iterrows())[1]
+                    # Presenter row usually: Name, Join, Leave, Duration(min), ...
+                    if len(parts) > 3 and isinstance(parts[3], (int, float)):
+                        metrics["duration"] = int(parts[3])
+                except: pass
+                break
+
+        # 3. Locate Sections
         p_start, a_start = -1, -1
         for i, line in enumerate(lines):
             if "Panelist Details" in line: p_start = i
             if "Attendee Details" in line: a_start = i
         
-        # Panelist
-        if p_start != -1:
+        # 4. Panelist (Trainer) - Only if NOT already found duration (Simulive)
+        # If it's simulive, the Panelist section is often empty or irrelevant for duration
+        if p_start != -1 and not metrics["is_simulive"]:
             chunk = lines[p_start+1:a_start if a_start!=-1 else len(lines)]
             p_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Join Time" in l), -1)
             if p_head != -1:
                 df_p = pd.read_csv(io.StringIO("\n".join(chunk[p_head:])), index_col=False)
-                name, join, leave = [next((c for c in df_p.columns if k in c), None) for k in ["User Name", "Join Time", "Leave Time"]]
+                name = next((c for c in df_p.columns if "User Name" in c), None)
+                join = next((c for c in df_p.columns if "Join Time" in c), None)
+                leave = next((c for c in df_p.columns if "Leave Time" in c), None)
+                
                 if name and join and leave:
-                    df_p = df_p[~df_p[name].astype(str).str.lower().str.contains('team be10x|host|notetaker|admin')]
-                    df_p[join], df_p[leave] = pd.to_datetime(df_p[join], errors='coerce'), pd.to_datetime(df_p[leave], errors='coerce')
-                    df_p.dropna(subset=[join, leave], inplace=True)
-                    stats = [(p, calculate_precise_duration(list(zip(g[join], g[leave])))) for p, g in df_p.groupby(name)]
+                    excl = ['team be10x', 'host', 'notetaker', 'otter', 'admin', 'assistant']
+                    df_p = df_p[~df_p[name].astype(str).str.lower().str.contains('|'.join(excl))]
+                    df_p[join] = pd.to_datetime(df_p[join], errors='coerce')
+                    df_p[leave] = pd.to_datetime(df_p[leave], errors='coerce')
+                    df_p = df_p.dropna(subset=[join, leave])
+                    
+                    stats = []
+                    for p, g in df_p.groupby(name):
+                        dur = calculate_precise_duration(list(zip(g[join], g[leave])))
+                        stats.append((p, dur))
                     if stats:
                         stats.sort(key=lambda x: x[1], reverse=True)
                         metrics["trainer"], metrics["duration"] = stats[0]
         
-        # Attendees
+        # 5. Attendees
         if a_start != -1:
             chunk = lines[a_start+1:]
             a_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Email" in l), -1)
             if a_head != -1:
                 df_a = pd.read_csv(io.StringIO("\n".join(chunk[a_head:])), index_col=False)
-                email, join, leave = [next((c for c in df_a.columns if k in c), None) for k in ["Email", "Join Time", "Leave Time"]]
+                email = next((c for c in df_a.columns if "Email" in c), None)
+                join = next((c for c in df_a.columns if "Join Time" in c), None)
+                leave = next((c for c in df_a.columns if "Leave Time" in c), None)
+                
                 if email: metrics["unique"] = df_a[email].astype(str).str.strip().str.lower().nunique()
                 if join and leave:
-                    df_a[join], df_a[leave] = pd.to_datetime(df_a[join], errors='coerce'), pd.to_datetime(df_a[leave], errors='coerce')
-                    df_a.dropna(subset=[join, leave], inplace=True)
+                    df_a[join] = pd.to_datetime(df_a[join], errors='coerce')
+                    df_a[leave] = pd.to_datetime(df_a[leave], errors='coerce')
+                    df_a = df_a.dropna(subset=[join, leave])
+                    
                     timeline, peak = generate_retention_curve(df_a, join, leave)
-                    metrics["peak"], metrics["timeline"] = peak, timeline
+                    metrics["peak"] = peak
+                    metrics["timeline"] = timeline
                     if not timeline.empty:
                         metrics["end_count"] = timeline.iloc[-16:-1]["Attendees"].mean() if len(timeline)>15 else timeline.iloc[-1]["Attendees"]
                         metrics["stickiness"] = (timeline.iloc[len(timeline)//2]["Attendees"] / peak) if peak > 0 else 0
-    except: pass
+    except Exception as e: print(e)
     return metrics
 
 def parse_poll_dynamic(uploaded_file):
@@ -162,29 +202,42 @@ def analyze_dynamic_columns(df):
     return metrics
 
 # ─── UI STRUCTURE ───
-tab_upload, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "📊 Executive Dashboard", "📉 Deep Retention"])
+tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 Recent Sessions", "📊 Executive Dashboard", "📉 Deep Retention"])
 
 # ==========================================
 # TAB 1: UPLOAD
 # ==========================================
 with tab_upload:
+    # Initialize session state for file uploader reset
+    if "upload_key" not in st.session_state: st.session_state.upload_key = 0
+
     with st.sidebar:
         st.header("1. Upload")
-        attendee_file = st.file_uploader("Attendee CSV", type=["csv"])
-        poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True)
+        # Key is bound to session_state. Incrementing key clears the uploader.
+        attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
+        poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
+        
         st.markdown("---")
         st.header("2. Verify")
-        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "timeline": None, "stickiness": 0}
+        
+        # Default empty stats
+        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "timeline": None, "stickiness": 0, "is_simulive": False}
         
         if attendee_file:
             stats = parse_attendee_smart(attendee_file)
-            if stats["trainer"] != "Unknown": st.success(f"✅ Found: {stats['trainer']}")
+            if stats["is_simulive"]:
+                st.info("🟣 Detected **Simulive** Session")
+            elif stats["trainer"] != "Unknown":
+                st.success(f"✅ Found: {stats['trainer']}")
         
         session_date = st.date_input("Date", value=stats["date"])
-        trainer = st.text_input("Trainer", value=stats["trainer"])
+        trainer = st.text_input("Trainer", value="Simulive Host" if stats["is_simulive"] else stats["trainer"])
         batch = st.text_input("Batch", placeholder="e.g. AI CAP B5")
         title = st.text_input("Title", value=stats["title"])
-        session_type = st.radio("Type", ["Live", "Simulive"], horizontal=True)
+        
+        # Auto-select radio based on detection
+        default_type_idx = 1 if stats["is_simulive"] else 0
+        session_type = st.radio("Type", ["Live", "Simulive"], index=default_type_idx, horizontal=True)
         
         c1, c2 = st.columns(2)
         duration = c1.number_input("Dur (m)", value=stats["duration"])
@@ -195,7 +248,7 @@ with tab_upload:
         save_btn = st.button("💾 Save to Cloud", type="primary", use_container_width=True)
 
     if poll_files and attendee_file:
-        st.markdown(f"## 🗓️ {session_date} | 👤 {trainer} | 🔴 {session_type}")
+        st.markdown(f"## 🗓️ {session_date} | 👤 {trainer} | {'🟣' if session_type=='Simulive' else '🔴'} {session_type}")
         st.markdown(f"**{title}**")
         st.divider()
 
@@ -257,11 +310,88 @@ with tab_upload:
                         row = [date_str, trainer, title, batch, duration, peak, unique, int(stats["end_count"]), f"{trainer_score:.2f}", ov_val, tr_val, data["responses"], nps_val, session_type]
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Saved!", icon="🎉")
+                        # AUTO-CLEAR: Increment key to reset uploaders on rerun
+                        st.session_state.upload_key += 1
+                        st.rerun()
                     except Exception as e: st.error(f"Error: {e}")
     else: st.info("👋 Go to Sidebar to Upload.")
 
 # ==========================================
-# TAB 2: ANALYTICS (EXECUTIVE)
+# TAB 2: RECENT SESSIONS (DRILL DOWN)
+# ==========================================
+with tab_list:
+    st.header("🔍 Recent Sessions Drill-Down")
+    
+    # 1. Fetch & Store
+    if "hist_df" not in st.session_state: st.session_state.hist_df = pd.DataFrame()
+    
+    if st.button("🔄 Refresh List", type="primary") or st.session_state.hist_df.empty:
+        st.session_state.hist_df = get_history_df()
+    
+    df = st.session_state.hist_df.copy()
+    
+    if not df.empty:
+        # Cleanup Headers
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        # Identify columns
+        date_col = next((c for c in df.columns if "Date" in c), None)
+        title_col = next((c for c in df.columns if "Title" in c or "Session" in c), None)
+        trainer_col = next((c for c in df.columns if "Trainer" in c), None)
+        
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            df = df.sort_values(by=date_col, ascending=False)
+            
+            # Date Filter
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                days = st.selectbox("Show Last:", [7, 30, 90, 365], index=1)
+                
+            filtered_df = df.head(50) # Just show recent 50 by default or filter by date
+            
+            # Selection Box
+            st.markdown("### 📋 Select a Session")
+            
+            # Create a display label column
+            if title_col and trainer_col:
+                filtered_df['Label'] = filtered_df[date_col].dt.strftime('%Y-%m-%d') + " | " + filtered_df[title_col] + " (" + filtered_df[trainer_col] + ")"
+                
+                selected_label = st.selectbox("Choose Session to View Details:", filtered_df['Label'].tolist())
+                
+                # Get selected row
+                row = filtered_df[filtered_df['Label'] == selected_label].iloc[0]
+                
+                st.divider()
+                st.subheader(f"📄 Report: {row[title_col]}")
+                st.caption(f"Date: {row[date_col].date()} | Trainer: {row[trainer_col]}")
+                
+                # METRICS GRID
+                # Map columns dynamically
+                m_cols = st.columns(4)
+                
+                # Helper to get val
+                def get_val(col_name):
+                    c = next((x for x in df.columns if col_name in x), None)
+                    return row[c] if c else "N/A"
+
+                m_cols[0].metric("Overall Rating", get_val("Overall"))
+                m_cols[1].metric("Peak Attendees", get_val("Peak"))
+                m_cols[2].metric("Duration", f"{get_val('Duration')} min")
+                m_cols[3].metric("NPS", get_val("NPS"))
+                
+                # Retention Score Card
+                st.markdown("---")
+                score = get_val("Retention Score") # Assuming 'Retention Score' col exists
+                st.markdown(f"**Retention Score:** {score if score != 'N/A' else 'Not Calculated'}")
+                
+            else:
+                st.error("Could not identify Title/Trainer columns.")
+    else:
+        st.info("Click Refresh to load sessions.")
+
+# ==========================================
+# TAB 3: ANALYTICS (EXECUTIVE)
 # ==========================================
 with tab_analytics:
     st.header("📊 Executive Dashboard")
@@ -350,7 +480,7 @@ with tab_analytics:
                             st.plotly_chart(fig_sc, use_container_width=True)
 
 # ==========================================
-# TAB 3: DEEP RETENTION LAB
+# TAB 4: DEEP RETENTION LAB
 # ==========================================
 with tab_retention:
     st.header("📉 Retention Lab")
