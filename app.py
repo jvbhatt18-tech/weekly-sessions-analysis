@@ -5,7 +5,7 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 import io
 import plotly.express as px
-import plotly.graph_objects as go
+import json
 
 # ─── 1. CONFIGURATION ───
 SHEET_ID = "1jYRJe9APAlIZdMQ9svuOo9gR1DbYfrCUjThvtO1DXcI"
@@ -21,7 +21,6 @@ st.markdown("""
     .score-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 10px; }
     .score-val { font-size: 2.2rem; font-weight: 800; margin: 0; }
     .score-label { font-size: 0.85rem; opacity: 0.9; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
-    .score-sub { font-size: 0.8rem; opacity: 0.8; margin-top: 5px; }
     .stDataFrame { background-color: white; border-radius: 10px; padding: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
 </style>
 """, unsafe_allow_html=True)
@@ -46,7 +45,7 @@ def connect_gsheet():
         return None
 
 def get_history_df():
-    # Fetch data without cache to ensure updates show immediately
+    # No cache for instant updates
     ws = connect_gsheet()
     if not ws: return pd.DataFrame()
     data = ws.get_all_records()
@@ -81,18 +80,27 @@ def generate_retention_curve(df, join_col, leave_col):
         df_tl = df_tl.set_index("Time").resample("1min").last().ffill().reset_index()
     return df_tl, peak
 
+def compress_curve(df_tl, points=30):
+    if df_tl is None or df_tl.empty: return ""
+    try:
+        indices = [int(i * (len(df_tl) - 1) / (points - 1)) for i in range(points)]
+        subset = df_tl.iloc[indices]
+        counts = subset["Attendees"].astype(int).tolist()
+        return "|".join(map(str, counts))
+    except: return ""
+
 def parse_attendee_smart(uploaded_file):
     metrics = {
         "trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, 
         "title": "Unknown", "date": date.today(), 
         "timeline": pd.DataFrame(), "end_count": 0, "stickiness": 0,
-        "is_simulive": False
+        "is_simulive": False, "curve_str": ""
     }
     try:
         content = uploaded_file.getvalue().decode("utf-8", errors='replace')
         lines = content.splitlines()
         
-        # 1. Metadata
+        # Metadata
         for line in lines[:5]:
             if "Topic" in line and "Start Time" in line:
                 try:
@@ -102,26 +110,25 @@ def parse_attendee_smart(uploaded_file):
                 except: pass
                 break
         
-        # 2. Simulive Detection (Scan footer for 'Presenter')
+        # Simulive Detection
         tail_lines = lines[-30:] if len(lines) > 30 else lines
         for line in tail_lines:
             if "Presenter" in line:
                 metrics["is_simulive"] = True
                 try:
                     parts = next(pd.read_csv(io.StringIO(line), header=None).iterrows())[1]
-                    # Presenter row usually: Name, Join, Leave, Duration(min)
                     if len(parts) > 3 and isinstance(parts[3], (int, float)):
                         metrics["duration"] = int(parts[3])
                 except: pass
                 break
 
-        # 3. Parse Attendees
+        # Sections
         p_start, a_start = -1, -1
         for i, line in enumerate(lines):
             if "Panelist Details" in line: p_start = i
             if "Attendee Details" in line: a_start = i
         
-        # Trainer (Only if not Simulive)
+        # Trainer
         if p_start != -1 and not metrics["is_simulive"]:
             chunk = lines[p_start+1:a_start if a_start!=-1 else len(lines)]
             p_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Join Time" in l), -1)
@@ -161,6 +168,7 @@ def parse_attendee_smart(uploaded_file):
                     timeline, peak = generate_retention_curve(df_a, join, leave)
                     metrics["peak"] = peak
                     metrics["timeline"] = timeline
+                    metrics["curve_str"] = compress_curve(timeline)
                     if not timeline.empty:
                         metrics["end_count"] = timeline.iloc[-16:-1]["Attendees"].mean() if len(timeline)>15 else timeline.iloc[-1]["Attendees"]
                         metrics["stickiness"] = (timeline.iloc[len(timeline)//2]["Attendees"] / peak) if peak > 0 else 0
@@ -182,17 +190,25 @@ def parse_poll_dynamic(uploaded_file):
     except: return None
 
 def analyze_dynamic_columns(df):
-    metrics = {"ratings": {}, "nps": {}, "responses": len(df)}
+    metrics = {"ratings": {}, "nps": {}, "responses": len(df), "json_dist": "{}"}
+    dist_storage = {}
     for col in df.columns:
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
         num = pd.to_numeric(df[col], errors='coerce')
         if num.notna().sum() > (len(df)*0.1):
             avg = num.mean()
-            if 0<=avg<=5: metrics["ratings"][col] = {"avg": round(avg, 2), "dist": num.value_counts().reindex([5,4,3,2,1], fill_value=0)}
+            if 0<=avg<=5: 
+                counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
+                metrics["ratings"][col] = {"avg": round(avg, 2), "dist": counts}
+                key_type = "Overall" if "overall" in clean else "Trainer" if "trainer" in clean else col
+                dist_storage[key_type] = counts.to_dict()
             if "recommend" in clean or "friend" in clean:
                 prom, det = ((num>=9).sum(), (num<=6).sum()) if num.max()>5 else ((num==5).sum(), (num<=3).sum())
                 metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
+                if num.max() > 5:
+                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(num.notna().sum() - prom - det)}
+    metrics["json_dist"] = json.dumps(dist_storage)
     return metrics
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
@@ -204,16 +220,13 @@ tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Sessi
 # ==========================================
 with tab_upload:
     if "upload_key" not in st.session_state: st.session_state.upload_key = 0
-
     with st.sidebar:
         st.header("1. Upload")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
-        
         st.markdown("---")
         st.header("2. Verify")
-        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None}
-        
+        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
         if attendee_file:
             stats = parse_attendee_smart(attendee_file)
             if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
@@ -225,12 +238,10 @@ with tab_upload:
         batch = st.text_input("Batch", placeholder="e.g. AI CAP B5")
         title = st.text_input("Title", value=stats["title"])
         session_type = st.radio("Type", ["Live", "Simulive"], index=1 if stats["is_simulive"] else 0, horizontal=True)
-        
         c1, c2 = st.columns(2)
         duration = c1.number_input("Dur (m)", value=stats["duration"])
         peak = c2.number_input("Peak", value=stats["peak"])
         unique = st.number_input("Unique", value=stats["unique"])
-        
         st.markdown("---")
         save_btn = st.button("💾 Save to Cloud", type="primary", use_container_width=True)
 
@@ -241,7 +252,6 @@ with tab_upload:
 
         poll_files.sort(key=lambda x: x.name)
         df_poll = parse_poll_dynamic(poll_files[-1])
-        
         if df_poll is not None:
             data = analyze_dynamic_columns(df_poll)
             ov_key = next((k for k in data["ratings"] if "overall" in k.lower()), None)
@@ -265,14 +275,11 @@ with tab_upload:
             m4.metric("Trainer Rating", tr_val)
             m5.metric("NPS", nps_val)
             st.divider()
-            
             if stats["timeline"] is not None and not stats["timeline"].empty:
                 st.subheader("📉 Retention Curve")
                 fig = px.area(stats["timeline"], x="Time", y="Attendees", template="plotly_white")
-                fig.update_layout(height=350, margin=dict(l=20, r=20, t=10, b=20), hovermode="x unified")
                 fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)")
                 st.plotly_chart(fig, use_container_width=True)
-            
             if data["ratings"]:
                 st.divider()
                 st.subheader("📈 Ratings Breakdown")
@@ -294,7 +301,7 @@ with tab_upload:
                 if ws:
                     try:
                         date_str = session_date.strftime("%Y-%m-%d")
-                        row = [date_str, trainer, title, batch, duration, peak, unique, int(stats["end_count"]), f"{trainer_score:.2f}", ov_val, tr_val, data["responses"], nps_val, session_type]
+                        row = [date_str, trainer, title, batch, duration, peak, unique, int(stats["end_count"]), f"{trainer_score:.2f}", ov_val, tr_val, data["responses"], nps_val, session_type, stats["curve_str"], data["json_dist"]]
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Saved!", icon="🎉")
                         st.session_state.upload_key += 1
@@ -307,42 +314,35 @@ with tab_upload:
 # ==========================================
 with tab_list:
     st.header("🔍 Recent Sessions Registry")
-    
-    if st.button("🔄 Refresh List", type="primary"):
-        st.session_state.pop('hist_df', None)
+    if st.button("🔄 Refresh List", type="primary"): st.session_state.pop('hist_df', None)
     
     if 'hist_df' not in st.session_state or st.session_state.hist_df.empty:
         st.session_state.hist_df = get_history_df()
     
     df = st.session_state.hist_df.copy()
-    
     if not df.empty:
-        # Cleanup
         df.columns = [str(c).strip() for c in df.columns]
-        
-        # Map Columns
         date_col = next((c for c in df.columns if "Date" in c), None)
         title_col = next((c for c in df.columns if "Title" in c or "Session" in c), None)
         trainer_col = next((c for c in df.columns if "Trainer" in c), None)
         batch_col = next((c for c in df.columns if "Batch" in c), None)
         rating_col = next((c for c in df.columns if "Overall" in c), None)
-        type_col = next((c for c in df.columns if "Type" in c), None)
+        tr_rating_col = next((c for c in df.columns if "Trainer Rating" in c), None)
         peak_col = next((c for c in df.columns if "Peak" in c), None)
         end_col = next((c for c in df.columns if "End" in c), None)
+        dur_col = next((c for c in df.columns if "Duration" in c), None)
+        type_col = next((c for c in df.columns if "Type" in c), None)
+        curve_col = next((c for c in df.columns if "Curve" in c), None)
+        dist_col = next((c for c in df.columns if "Rating" in c and "Dist" in c or "json" in c), None)
         
         if date_col and title_col:
-            # Format Data for Table
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
             df_disp = df.sort_values(by=date_col, ascending=False).copy()
             
-            # Select relevant columns for the table
+            # STYLING THE TABLE
             table_cols = [date_col, trainer_col, title_col, batch_col, rating_col, type_col]
-            table_cols = [c for c in table_cols if c] # Filter Nones
+            table_cols = [c for c in table_cols if c]
             
-            st.markdown("### 📋 Select a Session")
-            st.caption("Click a row to view the full report card below.")
-            
-            # INTERACTIVE TABLE
             selection = st.dataframe(
                 df_disp[table_cols],
                 use_container_width=True,
@@ -350,66 +350,78 @@ with tab_list:
                 selection_mode="single-row",
                 on_select="rerun",
                 column_config={
-                    date_col: st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                    rating_col: st.column_config.NumberColumn("Rating", format="%.2f ⭐"),
+                    date_col: st.column_config.DateColumn("Date", format="DD MM YY"),
+                    rating_col: st.column_config.ProgressColumn("Rating", format="%.2f", min_value=1, max_value=5),
                     type_col: st.column_config.TextColumn("Type", width="small")
                 }
             )
             
-            # DETAIL VIEW
             if selection.selection.rows:
                 sel_idx = selection.selection.rows[0]
                 row = df_disp.iloc[sel_idx]
                 
                 st.divider()
-                st.markdown(f"## 📄 Report: {row[title_col]}")
+                st.markdown(f"## 📄 {row[title_col]}")
                 st.caption(f"📅 {row[date_col].date()} | 👤 {row[trainer_col]} | 🎓 {row[batch_col]}")
                 
-                # Helper to safely get value
-                def safe_get(c, default=0):
+                def safe_get(row, c, default=0):
                     return row[c] if c and c in row and pd.notnull(row[c]) else default
 
-                # 1. SCORES
-                peak = safe_get(peak_col, 0)
-                end = safe_get(end_col, 0)
-                rating = safe_get(rating_col, 0)
+                peak = safe_get(row, peak_col)
+                end = safe_get(row, end_col)
+                ov_rate = safe_get(row, rating_col)
+                tr_rate = safe_get(row, tr_rating_col)
+                duration = safe_get(row, dur_col)
                 
-                # Reconstruct Scores
-                stickiness = (end / peak * 100) if peak > 0 else 0
-                ret_score = (end/peak * rating) if peak > 0 else 0
-                
-                sc1, sc2 = st.columns(2)
-                sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{ret_score:.2f}</div></div>""", unsafe_allow_html=True)
-                sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
-                st.write("")
-
-                # 2. METRICS
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Overall Rating", f"{rating:.2f}")
-                m2.metric("Peak Attendees", peak)
-                m3.metric("End Count", end)
-                m4.metric("Duration", f"{safe_get(next((x for x in df.columns if 'Duration' in x), None), 0)} min")
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Overall Rating", f"{ov_rate:.2f}" if ov_rate else "-")
+                m2.metric("Trainer Rating", f"{tr_rate:.2f}" if tr_rate else "-")
+                m3.metric("Peak", peak)
+                m4.metric("Duration", mins_to_hhmm(duration))
+                m5.metric("End Count", end)
                 
                 st.divider()
+                st.subheader("📉 Retention Curve")
                 
-                # 3. RECONSTRUCTED RETENTION CHART (Linear Decay Proxy)
-                if peak > 0:
-                    st.subheader("📉 Retention Analysis (Linear Model)")
-                    st.caption("Reconstructed from Peak and End data points.")
-                    
-                    # Create a 2-point dataframe
-                    sim_data = pd.DataFrame({
-                        "Progress": ["Start (Peak)", "End (Final)"],
-                        "Attendees": [peak, end]
-                    })
-                    
-                    fig_sim = px.area(sim_data, x="Progress", y="Attendees", template="plotly_white")
-                    fig_sim.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)")
-                    # Fix Y axis to start at 0
-                    fig_sim.update_yaxes(range=[0, peak * 1.1])
-                    st.plotly_chart(fig_sim, use_container_width=True)
-                else:
-                    st.warning("Insufficient data to plot retention (Peak is 0).")
+                curve_data = None
+                if curve_col: curve_data = str(row[curve_col])
+                elif len(row) > 14: curve_data = str(row.iloc[14])
+                
+                if curve_data and "|" in curve_data:
+                    try:
+                        counts = [float(x) for x in curve_data.split("|")]
+                        x_axis = [i * (duration/len(counts)) for i in range(len(counts))]
+                        chart_df = pd.DataFrame({"Time (min)": x_axis, "Attendees": counts})
+                        fig = px.area(chart_df, x="Time (min)", y="Attendees", template="plotly_white")
+                        fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)")
+                        st.plotly_chart(fig, use_container_width=True)
+                    except: st.caption("⚠️ Error parsing retention data.")
+                elif peak > 0:
+                    st.caption("ℹ️ Using Linear Approximation (Historical Data)")
+                    sim_data = pd.DataFrame({"Progress": ["Start", "End"], "Attendees": [peak, end]})
+                    fig = px.area(sim_data, x="Progress", y="Attendees", template="plotly_white")
+                    fig.update_traces(line_color="#95a5a6", fillcolor="rgba(149, 165, 166, 0.2)")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                st.subheader("📊 Rating Distributions")
+                dist_json = None
+                if dist_col: dist_json = str(row[dist_col])
+                elif len(row) > 15: dist_json = str(row.iloc[15])
+                
+                if dist_json and "{" in dist_json:
+                    try:
+                        d_data = json.loads(dist_json)
+                        cols = st.columns(3)
+                        i = 0
+                        for category, values in d_data.items():
+                            if i < 3:
+                                with cols[i]:
+                                    st.caption(f"{category}")
+                                    df_d = pd.DataFrame.from_dict(values, orient='index', columns=['Count'])
+                                    st.bar_chart(df_d)
+                                i += 1
+                    except: st.caption("No detail data.")
+                else: st.caption("ℹ️ Detailed rating counts not saved.")
 
 # ==========================================
 # TAB 3: EXECUTIVE DASHBOARD
@@ -428,35 +440,39 @@ with tab_analytics:
         trainer_col = next((c for c in df.columns if "Trainer" in c), None)
         rating_col = next((c for c in df.columns if "Overall" in c), None)
         type_col = next((c for c in df.columns if "Type" in c), None)
+        batch_col = next((c for c in df.columns if "Batch" in c), None)
         
         if date_col:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
             df = df.sort_values(by=date_col)
-            
-            # GLOBAL FILTER
             min_d, max_d = df[date_col].min(), df[date_col].max()
             sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="exec_d")
             if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
+            
+            # 1. BATCH HEALTH HEATMAP (RESTORED)
+            st.markdown("### 🎓 Batch Health Heatmap")
+            if batch_col and rating_col:
+                df['Month'] = df[date_col].dt.strftime('%Y-%m')
+                pivot = df.pivot_table(index=batch_col, columns='Month', values=rating_col, aggfunc='mean')
+                fig_h = px.imshow(pivot, text_auto=".1f", aspect="auto", color_continuous_scale="RdYlGn", origin='lower')
+                st.plotly_chart(fig_h, use_container_width=True)
+            st.divider()
 
-            # 1. LIVE vs SIMULIVE
+            # 2. LIVE vs SIMULIVE
             if type_col and rating_col:
                 st.markdown("### 🔴 Live vs. 🟣 Simulive")
-                # Normalize case
                 df['Type_Norm'] = df[type_col].astype(str).str.lower()
                 live_avg = df[df['Type_Norm'] == 'live'][rating_col].mean()
                 sim_avg = df[df['Type_Norm'] == 'simulive'][rating_col].mean()
-                
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Live Avg", f"{live_avg:.2f}" if pd.notna(live_avg) else "-")
                 c2.metric("Simulive Avg", f"{sim_avg:.2f}" if pd.notna(sim_avg) else "-")
                 c3.metric("Gap", f"{(live_avg - sim_avg):.2f}" if pd.notna(live_avg) and pd.notna(sim_avg) else "-")
-                
                 fig = px.box(df, x=type_col, y=rating_col, color=type_col, points="all", template="plotly_white")
                 st.plotly_chart(fig, use_container_width=True)
-            
             st.divider()
             
-            # 2. TRAINER MATRIX
+            # 3. TRAINER MATRIX
             if trainer_col and rating_col:
                 st.markdown("### 🏆 Trainer Matrix")
                 t_stats = df.groupby(trainer_col).agg(
@@ -466,7 +482,6 @@ with tab_analytics:
                 ).reset_index()
                 t_stats['Star %'] = (t_stats['High']/t_stats['Count']*100).round(1)
                 t_stats['Avg'] = t_stats['Avg'].round(2)
-                
                 fig_bub = px.scatter(t_stats, x="Count", y="Avg", size="Count", color="Star %", hover_name=trainer_col, 
                                      color_continuous_scale="RdYlGn", size_max=60, template="plotly_white")
                 fig_bub.add_hline(y=4.5, line_dash="dot")
@@ -495,7 +510,6 @@ with tab_retention:
             df[peak_col] = pd.to_numeric(df[peak_col], errors='coerce').fillna(0)
             df[end_col] = pd.to_numeric(df[end_col], errors='coerce').fillna(0)
             
-            # Global Filter
             min_d, max_d = df[date_col].min(), df[date_col].max()
             sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="ret_d")
             if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
@@ -503,7 +517,6 @@ with tab_retention:
             df = df[df[peak_col] > 0].sort_values(by=date_col)
             
             if not df.empty:
-                # BATCH DECAY
                 st.markdown("### 🏚️ Batch Decay")
                 if batch_col:
                     sb = st.selectbox("Select Batch", df[batch_col].unique())
@@ -517,7 +530,6 @@ with tab_retention:
                         st.plotly_chart(fig, use_container_width=True)
                 
                 st.divider()
-                # STICKINESS
                 if end_col:
                     df['Stick'] = (df[end_col]/df[peak_col]*100)
                     st.markdown("### 🧲 Stickiness Trend")
