@@ -45,7 +45,6 @@ def connect_gsheet():
         return None
 
 def get_history_df():
-    # No cache for instant updates
     ws = connect_gsheet()
     if not ws: return pd.DataFrame()
     data = ws.get_all_records()
@@ -213,17 +212,19 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 History & Details", "📊 Dashboard", "📉 Retention Lab"])
+tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 Recent Sessions", "📊 Dashboard", "📉 Retention Lab"])
 
 # ==========================================
 # TAB 1: UPLOAD
 # ==========================================
 with tab_upload:
     if "upload_key" not in st.session_state: st.session_state.upload_key = 0
+
     with st.sidebar:
         st.header("1. Upload")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
+        
         st.markdown("---")
         st.header("2. Verify")
         stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
@@ -278,7 +279,7 @@ with tab_upload:
             if stats["timeline"] is not None and not stats["timeline"].empty:
                 st.subheader("📉 Retention Curve")
                 fig = px.area(stats["timeline"], x="Time", y="Attendees", template="plotly_white")
-                fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)")
+                fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)", line_shape="spline")
                 st.plotly_chart(fig, use_container_width=True)
             if data["ratings"]:
                 st.divider()
@@ -339,7 +340,6 @@ with tab_list:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
             df_disp = df.sort_values(by=date_col, ascending=False).copy()
             
-            # STYLING THE TABLE
             table_cols = [date_col, trainer_col, title_col, batch_col, rating_col, type_col]
             table_cols = [c for c in table_cols if c]
             
@@ -393,7 +393,7 @@ with tab_list:
                         x_axis = [i * (duration/len(counts)) for i in range(len(counts))]
                         chart_df = pd.DataFrame({"Time (min)": x_axis, "Attendees": counts})
                         fig = px.area(chart_df, x="Time (min)", y="Attendees", template="plotly_white")
-                        fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)")
+                        fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)", line_shape="spline")
                         st.plotly_chart(fig, use_container_width=True)
                     except: st.caption("⚠️ Error parsing retention data.")
                 elif peak > 0:
@@ -449,7 +449,6 @@ with tab_analytics:
             sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="exec_d")
             if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
             
-            # 1. BATCH HEALTH HEATMAP (RESTORED)
             st.markdown("### 🎓 Batch Health Heatmap")
             if batch_col and rating_col:
                 df['Month'] = df[date_col].dt.strftime('%Y-%m')
@@ -458,7 +457,6 @@ with tab_analytics:
                 st.plotly_chart(fig_h, use_container_width=True)
             st.divider()
 
-            # 2. LIVE vs SIMULIVE
             if type_col and rating_col:
                 st.markdown("### 🔴 Live vs. 🟣 Simulive")
                 df['Type_Norm'] = df[type_col].astype(str).str.lower()
@@ -472,7 +470,6 @@ with tab_analytics:
                 st.plotly_chart(fig, use_container_width=True)
             st.divider()
             
-            # 3. TRAINER MATRIX
             if trainer_col and rating_col:
                 st.markdown("### 🏆 Trainer Matrix")
                 t_stats = df.groupby(trainer_col).agg(
