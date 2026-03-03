@@ -5,6 +5,7 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 import io
 import plotly.express as px
+import plotly.graph_objects as go
 
 # ─── 1. CONFIGURATION ───
 SHEET_ID = "1jYRJe9APAlIZdMQ9svuOo9gR1DbYfrCUjThvtO1DXcI"
@@ -21,6 +22,7 @@ st.markdown("""
     .score-val { font-size: 2.2rem; font-weight: 800; margin: 0; }
     .score-label { font-size: 0.85rem; opacity: 0.9; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
     .score-sub { font-size: 0.8rem; opacity: 0.8; margin-top: 5px; }
+    .stDataFrame { background-color: white; border-radius: 10px; padding: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -31,25 +33,24 @@ def mins_to_hhmm(minutes):
         return f"{m // 60}h {m % 60:02d}m"
     except: return "0h 00m"
 
-# REMOVED CACHE to prevent "Stuck" issues
 def connect_gsheet():
     if "gcp_service_account" not in st.secrets: 
-        st.error("❌ Secrets not found in .streamlit/secrets.toml")
+        st.error("❌ Secrets not found.")
         return None
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
     gc = gspread.authorize(creds)
     try: return gc.open_by_key(SHEET_ID).sheet1
     except Exception as e:
-        st.error(f"❌ Connection Failed: {e}")
+        st.error(f"❌ Connection Error: {e}")
         return None
 
 def get_history_df():
-    with st.spinner("🔄 Fetching data from Google Sheets..."):
-        ws = connect_gsheet()
-        if not ws: return pd.DataFrame()
-        data = ws.get_all_records()
-        return pd.DataFrame(data)
+    # Fetch data without cache to ensure updates show immediately
+    ws = connect_gsheet()
+    if not ws: return pd.DataFrame()
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
 
 # ─── PARSERS ───
 def calculate_precise_duration(intervals):
@@ -101,29 +102,26 @@ def parse_attendee_smart(uploaded_file):
                 except: pass
                 break
         
-        # 2. Check for Simulive (Presenter at bottom)
-        # Scan last 20 lines for "Other Attended" and "Presenter"
-        tail_lines = lines[-20:] if len(lines) > 20 else lines
+        # 2. Simulive Detection (Scan footer for 'Presenter')
+        tail_lines = lines[-30:] if len(lines) > 30 else lines
         for line in tail_lines:
             if "Presenter" in line:
                 metrics["is_simulive"] = True
-                # Extract duration from Presenter row if possible
                 try:
                     parts = next(pd.read_csv(io.StringIO(line), header=None).iterrows())[1]
-                    # Presenter row usually: Name, Join, Leave, Duration(min), ...
+                    # Presenter row usually: Name, Join, Leave, Duration(min)
                     if len(parts) > 3 and isinstance(parts[3], (int, float)):
                         metrics["duration"] = int(parts[3])
                 except: pass
                 break
 
-        # 3. Locate Sections
+        # 3. Parse Attendees
         p_start, a_start = -1, -1
         for i, line in enumerate(lines):
             if "Panelist Details" in line: p_start = i
             if "Attendee Details" in line: a_start = i
         
-        # 4. Panelist (Trainer) - Only if NOT already found duration (Simulive)
-        # If it's simulive, the Panelist section is often empty or irrelevant for duration
+        # Trainer (Only if not Simulive)
         if p_start != -1 and not metrics["is_simulive"]:
             chunk = lines[p_start+1:a_start if a_start!=-1 else len(lines)]
             p_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Join Time" in l), -1)
@@ -132,14 +130,12 @@ def parse_attendee_smart(uploaded_file):
                 name = next((c for c in df_p.columns if "User Name" in c), None)
                 join = next((c for c in df_p.columns if "Join Time" in c), None)
                 leave = next((c for c in df_p.columns if "Leave Time" in c), None)
-                
                 if name and join and leave:
                     excl = ['team be10x', 'host', 'notetaker', 'otter', 'admin', 'assistant']
                     df_p = df_p[~df_p[name].astype(str).str.lower().str.contains('|'.join(excl))]
                     df_p[join] = pd.to_datetime(df_p[join], errors='coerce')
                     df_p[leave] = pd.to_datetime(df_p[leave], errors='coerce')
                     df_p = df_p.dropna(subset=[join, leave])
-                    
                     stats = []
                     for p, g in df_p.groupby(name):
                         dur = calculate_precise_duration(list(zip(g[join], g[leave])))
@@ -148,7 +144,7 @@ def parse_attendee_smart(uploaded_file):
                         stats.sort(key=lambda x: x[1], reverse=True)
                         metrics["trainer"], metrics["duration"] = stats[0]
         
-        # 5. Attendees
+        # Attendees
         if a_start != -1:
             chunk = lines[a_start+1:]
             a_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Email" in l), -1)
@@ -157,20 +153,18 @@ def parse_attendee_smart(uploaded_file):
                 email = next((c for c in df_a.columns if "Email" in c), None)
                 join = next((c for c in df_a.columns if "Join Time" in c), None)
                 leave = next((c for c in df_a.columns if "Leave Time" in c), None)
-                
                 if email: metrics["unique"] = df_a[email].astype(str).str.strip().str.lower().nunique()
                 if join and leave:
                     df_a[join] = pd.to_datetime(df_a[join], errors='coerce')
                     df_a[leave] = pd.to_datetime(df_a[leave], errors='coerce')
                     df_a = df_a.dropna(subset=[join, leave])
-                    
                     timeline, peak = generate_retention_curve(df_a, join, leave)
                     metrics["peak"] = peak
                     metrics["timeline"] = timeline
                     if not timeline.empty:
                         metrics["end_count"] = timeline.iloc[-16:-1]["Attendees"].mean() if len(timeline)>15 else timeline.iloc[-1]["Attendees"]
                         metrics["stickiness"] = (timeline.iloc[len(timeline)//2]["Attendees"] / peak) if peak > 0 else 0
-    except Exception as e: print(e)
+    except: pass
     return metrics
 
 def parse_poll_dynamic(uploaded_file):
@@ -201,43 +195,36 @@ def analyze_dynamic_columns(df):
                 metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
     return metrics
 
-# ─── UI STRUCTURE ───
-tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 Recent Sessions", "📊 Executive Dashboard", "📉 Deep Retention"])
+# ─── UI ────────────────────────────────────────────────────────────────────────
+
+tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 History & Details", "📊 Dashboard", "📉 Retention Lab"])
 
 # ==========================================
 # TAB 1: UPLOAD
 # ==========================================
 with tab_upload:
-    # Initialize session state for file uploader reset
     if "upload_key" not in st.session_state: st.session_state.upload_key = 0
 
     with st.sidebar:
         st.header("1. Upload")
-        # Key is bound to session_state. Incrementing key clears the uploader.
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
         
         st.markdown("---")
         st.header("2. Verify")
-        
-        # Default empty stats
-        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "timeline": None, "stickiness": 0, "is_simulive": False}
+        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None}
         
         if attendee_file:
             stats = parse_attendee_smart(attendee_file)
-            if stats["is_simulive"]:
-                st.info("🟣 Detected **Simulive** Session")
-            elif stats["trainer"] != "Unknown":
-                st.success(f"✅ Found: {stats['trainer']}")
+            if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
+            elif stats["trainer"] != "Unknown": st.success(f"✅ Found: {stats['trainer']}")
         
         session_date = st.date_input("Date", value=stats["date"])
-        trainer = st.text_input("Trainer", value="Simulive Host" if stats["is_simulive"] else stats["trainer"])
+        trainer_val = "Simulive Host" if stats["is_simulive"] else stats["trainer"]
+        trainer = st.text_input("Trainer", value=trainer_val)
         batch = st.text_input("Batch", placeholder="e.g. AI CAP B5")
         title = st.text_input("Title", value=stats["title"])
-        
-        # Auto-select radio based on detection
-        default_type_idx = 1 if stats["is_simulive"] else 0
-        session_type = st.radio("Type", ["Live", "Simulive"], index=default_type_idx, horizontal=True)
+        session_type = st.radio("Type", ["Live", "Simulive"], index=1 if stats["is_simulive"] else 0, horizontal=True)
         
         c1, c2 = st.columns(2)
         duration = c1.number_input("Dur (m)", value=stats["duration"])
@@ -272,11 +259,11 @@ with tab_upload:
             sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stats["stickiness"]*100)}%</div><div class="score-sub">Audience remaining at half-time</div></div>""", unsafe_allow_html=True)
             st.write("")
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Duration", mins_to_hhmm(duration), help="Total active time.")
-            m2.metric("Unique Users", unique, help="Count of distinct email addresses.")
-            m3.metric("Overall Rating", ov_val, help="Overall Session Feedback.")
-            m4.metric("Trainer Rating", tr_val, help="Trainer Feedback.")
-            m5.metric("NPS", nps_val, help="Net Promoter Score.")
+            m1.metric("Duration", mins_to_hhmm(duration))
+            m2.metric("Unique Users", unique)
+            m3.metric("Overall Rating", ov_val)
+            m4.metric("Trainer Rating", tr_val)
+            m5.metric("NPS", nps_val)
             st.divider()
             
             if stats["timeline"] is not None and not stats["timeline"].empty:
@@ -310,247 +297,232 @@ with tab_upload:
                         row = [date_str, trainer, title, batch, duration, peak, unique, int(stats["end_count"]), f"{trainer_score:.2f}", ov_val, tr_val, data["responses"], nps_val, session_type]
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Saved!", icon="🎉")
-                        # AUTO-CLEAR: Increment key to reset uploaders on rerun
                         st.session_state.upload_key += 1
                         st.rerun()
                     except Exception as e: st.error(f"Error: {e}")
     else: st.info("👋 Go to Sidebar to Upload.")
 
 # ==========================================
-# TAB 2: RECENT SESSIONS (DRILL DOWN)
+# TAB 2: INTERACTIVE HISTORY
 # ==========================================
 with tab_list:
-    st.header("🔍 Recent Sessions Drill-Down")
+    st.header("🔍 Recent Sessions Registry")
     
-    # 1. Fetch & Store
-    if "hist_df" not in st.session_state: st.session_state.hist_df = pd.DataFrame()
+    if st.button("🔄 Refresh List", type="primary"):
+        st.session_state.pop('hist_df', None)
     
-    if st.button("🔄 Refresh List", type="primary") or st.session_state.hist_df.empty:
+    if 'hist_df' not in st.session_state or st.session_state.hist_df.empty:
         st.session_state.hist_df = get_history_df()
     
     df = st.session_state.hist_df.copy()
     
     if not df.empty:
-        # Cleanup Headers
+        # Cleanup
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Identify columns
+        # Map Columns
         date_col = next((c for c in df.columns if "Date" in c), None)
         title_col = next((c for c in df.columns if "Title" in c or "Session" in c), None)
         trainer_col = next((c for c in df.columns if "Trainer" in c), None)
+        batch_col = next((c for c in df.columns if "Batch" in c), None)
+        rating_col = next((c for c in df.columns if "Overall" in c), None)
+        type_col = next((c for c in df.columns if "Type" in c), None)
+        peak_col = next((c for c in df.columns if "Peak" in c), None)
+        end_col = next((c for c in df.columns if "End" in c), None)
         
-        if date_col:
+        if date_col and title_col:
+            # Format Data for Table
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-            df = df.sort_values(by=date_col, ascending=False)
+            df_disp = df.sort_values(by=date_col, ascending=False).copy()
             
-            # Date Filter
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                days = st.selectbox("Show Last:", [7, 30, 90, 365], index=1)
-                
-            filtered_df = df.head(50) # Just show recent 50 by default or filter by date
+            # Select relevant columns for the table
+            table_cols = [date_col, trainer_col, title_col, batch_col, rating_col, type_col]
+            table_cols = [c for c in table_cols if c] # Filter Nones
             
-            # Selection Box
             st.markdown("### 📋 Select a Session")
+            st.caption("Click a row to view the full report card below.")
             
-            # Create a display label column
-            if title_col and trainer_col:
-                filtered_df['Label'] = filtered_df[date_col].dt.strftime('%Y-%m-%d') + " | " + filtered_df[title_col] + " (" + filtered_df[trainer_col] + ")"
-                
-                selected_label = st.selectbox("Choose Session to View Details:", filtered_df['Label'].tolist())
-                
-                # Get selected row
-                row = filtered_df[filtered_df['Label'] == selected_label].iloc[0]
+            # INTERACTIVE TABLE
+            selection = st.dataframe(
+                df_disp[table_cols],
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                column_config={
+                    date_col: st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                    rating_col: st.column_config.NumberColumn("Rating", format="%.2f ⭐"),
+                    type_col: st.column_config.TextColumn("Type", width="small")
+                }
+            )
+            
+            # DETAIL VIEW
+            if selection.selection.rows:
+                sel_idx = selection.selection.rows[0]
+                row = df_disp.iloc[sel_idx]
                 
                 st.divider()
-                st.subheader(f"📄 Report: {row[title_col]}")
-                st.caption(f"Date: {row[date_col].date()} | Trainer: {row[trainer_col]}")
+                st.markdown(f"## 📄 Report: {row[title_col]}")
+                st.caption(f"📅 {row[date_col].date()} | 👤 {row[trainer_col]} | 🎓 {row[batch_col]}")
                 
-                # METRICS GRID
-                # Map columns dynamically
-                m_cols = st.columns(4)
-                
-                # Helper to get val
-                def get_val(col_name):
-                    c = next((x for x in df.columns if col_name in x), None)
-                    return row[c] if c else "N/A"
+                # Helper to safely get value
+                def safe_get(c, default=0):
+                    return row[c] if c and c in row and pd.notnull(row[c]) else default
 
-                m_cols[0].metric("Overall Rating", get_val("Overall"))
-                m_cols[1].metric("Peak Attendees", get_val("Peak"))
-                m_cols[2].metric("Duration", f"{get_val('Duration')} min")
-                m_cols[3].metric("NPS", get_val("NPS"))
+                # 1. SCORES
+                peak = safe_get(peak_col, 0)
+                end = safe_get(end_col, 0)
+                rating = safe_get(rating_col, 0)
                 
-                # Retention Score Card
-                st.markdown("---")
-                score = get_val("Retention Score") # Assuming 'Retention Score' col exists
-                st.markdown(f"**Retention Score:** {score if score != 'N/A' else 'Not Calculated'}")
+                # Reconstruct Scores
+                stickiness = (end / peak * 100) if peak > 0 else 0
+                ret_score = (end/peak * rating) if peak > 0 else 0
                 
-            else:
-                st.error("Could not identify Title/Trainer columns.")
-    else:
-        st.info("Click Refresh to load sessions.")
+                sc1, sc2 = st.columns(2)
+                sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{ret_score:.2f}</div></div>""", unsafe_allow_html=True)
+                sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+                st.write("")
+
+                # 2. METRICS
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Overall Rating", f"{rating:.2f}")
+                m2.metric("Peak Attendees", peak)
+                m3.metric("End Count", end)
+                m4.metric("Duration", f"{safe_get(next((x for x in df.columns if 'Duration' in x), None), 0)} min")
+                
+                st.divider()
+                
+                # 3. RECONSTRUCTED RETENTION CHART (Linear Decay Proxy)
+                if peak > 0:
+                    st.subheader("📉 Retention Analysis (Linear Model)")
+                    st.caption("Reconstructed from Peak and End data points.")
+                    
+                    # Create a 2-point dataframe
+                    sim_data = pd.DataFrame({
+                        "Progress": ["Start (Peak)", "End (Final)"],
+                        "Attendees": [peak, end]
+                    })
+                    
+                    fig_sim = px.area(sim_data, x="Progress", y="Attendees", template="plotly_white")
+                    fig_sim.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)")
+                    # Fix Y axis to start at 0
+                    fig_sim.update_yaxes(range=[0, peak * 1.1])
+                    st.plotly_chart(fig_sim, use_container_width=True)
+                else:
+                    st.warning("Insufficient data to plot retention (Peak is 0).")
 
 # ==========================================
-# TAB 3: ANALYTICS (EXECUTIVE)
+# TAB 3: EXECUTIVE DASHBOARD
 # ==========================================
 with tab_analytics:
     st.header("📊 Executive Dashboard")
+    if st.button("🔄 Refresh Data", key="refresh_exec", type="primary"): st.session_state.pop('exec_df', None)
     
-    # Init State
-    if "exec_df" not in st.session_state: st.session_state.exec_df = pd.DataFrame()
-
-    if st.button("🔄 Refresh Data", key="refresh_exec", type="primary") or not st.session_state.exec_df.empty:
-        if st.session_state.exec_df.empty: st.session_state.exec_df = get_history_df()
+    if 'exec_df' not in st.session_state or st.session_state.exec_df.empty:
+        st.session_state.exec_df = get_history_df()
+    
+    df = st.session_state.exec_df.copy()
+    if not df.empty:
+        df.columns = [str(c).strip() for c in df.columns]
+        date_col = next((c for c in df.columns if "Date" in c), None)
+        trainer_col = next((c for c in df.columns if "Trainer" in c), None)
+        rating_col = next((c for c in df.columns if "Overall" in c), None)
+        type_col = next((c for c in df.columns if "Type" in c), None)
         
-        df = st.session_state.exec_df.copy()
-        
-        if not df.empty:
-            df.columns = [str(c).strip() for c in df.columns]
-            date_col = next((c for c in df.columns if "Date" in c), None)
-            trainer_col = next((c for c in df.columns if "Trainer" in c), None)
-            rating_col = next((c for c in df.columns if "Overall" in c), None)
-            dur_col = next((c for c in df.columns if "Duration" in c), None)
-            resp_col = next((c for c in df.columns if "Responses" in c), None)
-            type_col = next((c for c in df.columns if "Type" in c), None)
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            df = df.sort_values(by=date_col)
+            
+            # GLOBAL FILTER
+            min_d, max_d = df[date_col].min(), df[date_col].max()
+            sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="exec_d")
+            if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
 
-            if date_col and rating_col:
-                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-                df[rating_col] = pd.to_numeric(df[rating_col], errors='coerce')
-                if dur_col: df[dur_col] = pd.to_numeric(df[dur_col], errors='coerce')
-                if resp_col: df[resp_col] = pd.to_numeric(df[resp_col], errors='coerce').fillna(0)
-                df = df.dropna(subset=[date_col]).sort_values(by=date_col)
-
-                # DATE FILTER
-                min_date, max_date = df[date_col].min(), df[date_col].max()
-                sel_dates = st.date_input("Filter Date Range", value=(min_date, max_date), key="exec_dates")
+            # 1. LIVE vs SIMULIVE
+            if type_col and rating_col:
+                st.markdown("### 🔴 Live vs. 🟣 Simulive")
+                # Normalize case
+                df['Type_Norm'] = df[type_col].astype(str).str.lower()
+                live_avg = df[df['Type_Norm'] == 'live'][rating_col].mean()
+                sim_avg = df[df['Type_Norm'] == 'simulive'][rating_col].mean()
                 
-                if len(sel_dates) == 2:
-                    start_d, end_d = pd.to_datetime(sel_dates[0]), pd.to_datetime(sel_dates[1])
-                    df_filt = df[(df[date_col] >= start_d) & (df[date_col] <= end_d)].copy()
-                else:
-                    df_filt = df.copy()
-
-                if df_filt.empty:
-                    st.warning("No data in selected date range.")
-                else:
-                    # LIVE vs SIMULIVE
-                    st.markdown("### 🔴 Live vs. 🟣 Simulive Gap")
-                    if type_col:
-                        live_avg = df_filt[df_filt[type_col].str.lower() == 'live'][rating_col].mean()
-                        sim_avg = df_filt[df_filt[type_col].str.lower() == 'simulive'][rating_col].mean()
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Live Avg Rating", f"{live_avg:.2f}" if pd.notna(live_avg) else "N/A")
-                        c2.metric("Simulive Avg Rating", f"{sim_avg:.2f}" if pd.notna(sim_avg) else "N/A")
-                        c3.metric("The Gap", f"{(live_avg - sim_avg):.2f}" if pd.notna(live_avg) and pd.notna(sim_avg) else "0.00")
-                        fig_box = px.box(df_filt, x=type_col, y=rating_col, color=type_col, points="all", template="plotly_white", title="Rating Distribution")
-                        st.plotly_chart(fig_box, use_container_width=True)
-                    st.divider()
-
-                    # TRAINER BUBBLE
-                    st.markdown("### 🏆 Trainer Performance Matrix")
-                    if trainer_col:
-                        t_stats = df_filt.groupby(trainer_col).agg(
-                            Sessions=(rating_col, 'count'),
-                            Avg_Rating=(rating_col, 'mean'),
-                            Responses=(resp_col, 'sum') if resp_col else (rating_col, 'count'),
-                            High_Rated=(rating_col, lambda x: (x > 4.6).sum())
-                        ).reset_index()
-                        t_stats['Consistency %'] = (t_stats['High_Rated'] / t_stats['Sessions'] * 100).round(1)
-                        t_stats['Avg_Rating'] = t_stats['Avg_Rating'].round(2)
-                        
-                        fig_bub = px.scatter(t_stats, x="Sessions", y="Avg_Rating", size="Responses", color="Consistency %",
-                                             hover_name=trainer_col, color_continuous_scale="RdYlGn", size_max=60, template="plotly_white")
-                        fig_bub.add_hline(y=4.5, line_dash="dot", annotation_text="Target 4.5")
-                        st.plotly_chart(fig_bub, use_container_width=True)
-                    st.divider()
-
-                    # TRENDS
-                    c_line, c_dur = st.columns(2)
-                    with c_line:
-                        st.markdown("#### 📅 Rating Trend")
-                        daily = df_filt.groupby(date_col)[rating_col].mean().reset_index()
-                        fig_line = px.line(daily, x=date_col, y=rating_col, markers=True, template="plotly_white")
-                        fig_line.update_traces(line_color="#764ba2")
-                        st.plotly_chart(fig_line, use_container_width=True)
-                    with c_dur:
-                        st.markdown("#### ⏱️ Duration vs. Rating")
-                        if dur_col:
-                            fig_sc = px.scatter(df_filt, x=dur_col, y=rating_col, color=rating_col, 
-                                                range_color=[3, 5], color_continuous_scale="RdYlGn", template="plotly_white")
-                            st.plotly_chart(fig_sc, use_container_width=True)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Live Avg", f"{live_avg:.2f}" if pd.notna(live_avg) else "-")
+                c2.metric("Simulive Avg", f"{sim_avg:.2f}" if pd.notna(sim_avg) else "-")
+                c3.metric("Gap", f"{(live_avg - sim_avg):.2f}" if pd.notna(live_avg) and pd.notna(sim_avg) else "-")
+                
+                fig = px.box(df, x=type_col, y=rating_col, color=type_col, points="all", template="plotly_white")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+            
+            # 2. TRAINER MATRIX
+            if trainer_col and rating_col:
+                st.markdown("### 🏆 Trainer Matrix")
+                t_stats = df.groupby(trainer_col).agg(
+                    Count=(rating_col,'count'),
+                    Avg=(rating_col,'mean'),
+                    High=(rating_col, lambda x: (x>4.6).sum())
+                ).reset_index()
+                t_stats['Star %'] = (t_stats['High']/t_stats['Count']*100).round(1)
+                t_stats['Avg'] = t_stats['Avg'].round(2)
+                
+                fig_bub = px.scatter(t_stats, x="Count", y="Avg", size="Count", color="Star %", hover_name=trainer_col, 
+                                     color_continuous_scale="RdYlGn", size_max=60, template="plotly_white")
+                fig_bub.add_hline(y=4.5, line_dash="dot")
+                st.plotly_chart(fig_bub, use_container_width=True)
 
 # ==========================================
-# TAB 4: DEEP RETENTION LAB
+# TAB 4: RETENTION LAB
 # ==========================================
 with tab_retention:
     st.header("📉 Retention Lab")
+    if st.button("🔄 Refresh Data", key="refresh_ret", type="primary"): st.session_state.pop('ret_df', None)
     
-    if "ret_df" not in st.session_state: st.session_state.ret_df = pd.DataFrame()
-
-    if st.button("🔄 Analyze Retention", key="refresh_retention", type="primary") or not st.session_state.ret_df.empty:
-        if st.session_state.ret_df.empty: st.session_state.ret_df = get_history_df()
+    if 'ret_df' not in st.session_state or st.session_state.ret_df.empty:
+        st.session_state.ret_df = get_history_df()
         
-        df = st.session_state.ret_df.copy()
-
-        if not df.empty:
-            df.columns = [str(c).strip() for c in df.columns]
-            peak_col = next((c for c in df.columns if "Peak" in c), None)
-            end_col = next((c for c in df.columns if "End" in c), None)
-            date_col = next((c for c in df.columns if "Date" in c), None)
-            batch_col = next((c for c in df.columns if "Batch" in c), None)
-
-            if peak_col and end_col and date_col:
-                # Cleanup
-                df[peak_col] = pd.to_numeric(df[peak_col], errors='coerce').fillna(0)
-                df[end_col] = pd.to_numeric(df[end_col], errors='coerce').fillna(0)
-                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df = st.session_state.ret_df.copy()
+    if not df.empty:
+        df.columns = [str(c).strip() for c in df.columns]
+        peak_col = next((c for c in df.columns if "Peak" in c), None)
+        end_col = next((c for c in df.columns if "End" in c), None)
+        date_col = next((c for c in df.columns if "Date" in c), None)
+        batch_col = next((c for c in df.columns if "Batch" in c), None)
+        
+        if peak_col and date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            df[peak_col] = pd.to_numeric(df[peak_col], errors='coerce').fillna(0)
+            df[end_col] = pd.to_numeric(df[end_col], errors='coerce').fillna(0)
+            
+            # Global Filter
+            min_d, max_d = df[date_col].min(), df[date_col].max()
+            sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="ret_d")
+            if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
+            
+            df = df[df[peak_col] > 0].sort_values(by=date_col)
+            
+            if not df.empty:
+                # BATCH DECAY
+                st.markdown("### 🏚️ Batch Decay")
+                if batch_col:
+                    sb = st.selectbox("Select Batch", df[batch_col].unique())
+                    b_df = df[df[batch_col] == sb].sort_values(by=date_col)
+                    if not b_df.empty:
+                        base = b_df.iloc[0][peak_col]
+                        b_df['Rel'] = (b_df[peak_col]/base*100) if base > 0 else 0
+                        b_df['Seq'] = range(1, len(b_df)+1)
+                        fig = px.line(b_df, x='Seq', y='Rel', markers=True, title=f"Decay: {sb}", template="plotly_white")
+                        fig.update_yaxes(range=[0, 110])
+                        st.plotly_chart(fig, use_container_width=True)
                 
-                # DATE FILTER (Global)
-                min_date, max_date = df[date_col].min(), df[date_col].max()
-                sel_dates = st.date_input("Filter Date Range", value=(min_date, max_date), key="ret_dates")
-                
-                if len(sel_dates) == 2:
-                    start_d, end_d = pd.to_datetime(sel_dates[0]), pd.to_datetime(sel_dates[1])
-                    df = df[(df[date_col] >= start_d) & (df[date_col] <= end_d)].copy()
-                
-                # FILTER: Valid data only
-                df_ret = df[df[peak_col] > 0].copy()
-                df_ret = df_ret.sort_values(by=date_col)
-                
-                if df_ret.empty:
-                    st.warning("⚠️ No retention data found in selected range.")
-                else:
-                    # BATCH DECAY
-                    st.markdown("### 🏚️ Batch Attendance Decay")
-                    st.caption("Attendance as % of the First Session in the filtered range.")
-                    if batch_col:
-                        sel_batch = st.selectbox("Select Batch", df_ret[batch_col].unique())
-                        b_df = df_ret[df_ret[batch_col] == sel_batch].sort_values(by=date_col)
-                        
-                        if not b_df.empty:
-                            baseline = b_df.iloc[0][peak_col]
-                            if baseline > 0:
-                                b_df['Relative_Retention'] = (b_df[peak_col] / baseline) * 100
-                            else:
-                                b_df['Relative_Retention'] = 0
-                            b_df['Session_Num'] = range(1, len(b_df) + 1)
-                            
-                            fig_dec = px.line(b_df, x='Session_Num', y='Relative_Retention', markers=True, title=f"Decay Curve: {sel_batch}",
-                                              labels={'Relative_Retention': '% of Session 1'}, template="plotly_white")
-                            fig_dec.update_traces(line_color="#e74c3c")
-                            fig_dec.update_yaxes(range=[0, 110])
-                            fig_dec.update_traces(hovertemplate='Session %{x}<br>Retention: %{y:.1f}%<br>Raw Attendees: %{customdata}')
-                            fig_dec.data[0].customdata = b_df[peak_col]
-                            st.plotly_chart(fig_dec, use_container_width=True)
-                    st.divider()
-
-                    # STICKINESS TREND
-                    df_stick = df_ret[df_ret[end_col] > 0].copy()
-                    if not df_stick.empty:
-                        df_stick['Stickiness'] = (df_stick[end_col] / df_stick[peak_col]) * 100
-                        st.markdown("### 🧲 Stickiness Trend (End/Peak %)")
-                        fig_stick = px.line(df_stick, x=date_col, y="Stickiness", markers=True, title="Stickiness % Over Time", template="plotly_white")
-                        fig_stick.update_traces(line_color="#27ae60") 
-                        st.plotly_chart(fig_stick, use_container_width=True)
-                    else: st.info("No 'End Count' data available for Stickiness analysis yet.")
-        else: st.warning("No data found.")
+                st.divider()
+                # STICKINESS
+                if end_col:
+                    df['Stick'] = (df[end_col]/df[peak_col]*100)
+                    st.markdown("### 🧲 Stickiness Trend")
+                    fig_s = px.line(df, x=date_col, y="Stick", markers=True, title="Stickiness % (End/Peak)", template="plotly_white")
+                    fig_s.update_traces(line_color="#27ae60")
+                    st.plotly_chart(fig_s, use_container_width=True)
+            else:
+                st.warning("No valid retention data in range.")
