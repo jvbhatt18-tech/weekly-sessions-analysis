@@ -45,7 +45,6 @@ def connect_gsheet():
         return None
 
 def get_history_df():
-    # No cache for instant updates
     ws = connect_gsheet()
     if not ws: return pd.DataFrame()
     data = ws.get_all_records()
@@ -164,8 +163,8 @@ def parse_attendee_smart(uploaded_file):
                     metrics["peak"] = peak
                     metrics["timeline"] = timeline
                     metrics["curve_str"] = compress_curve(timeline)
+                    # SMART STICKINESS: Last 10%
                     if not timeline.empty:
-                        # Smart Stickiness: Last 10% average
                         total_mins = len(timeline)
                         tail_mins = max(1, int(total_mins * 0.10))
                         metrics["end_count"] = timeline.iloc[-tail_mins:]["Attendees"].mean()
@@ -176,12 +175,15 @@ def parse_attendee_smart(uploaded_file):
 def parse_poll_dynamic(uploaded_file):
     try:
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
+        # Find header by looking for common columns
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
+        
         data = [lines[h_idx]]
         for l in lines[h_idx+1:]:
             if "Feedback Poll" in l: break
             data.append(l)
+            
         df = pd.read_csv(io.StringIO("\n".join(data)), index_col=False)
         df.columns = [c.strip() for c in df.columns]
         return df
@@ -190,25 +192,48 @@ def parse_poll_dynamic(uploaded_file):
 def analyze_dynamic_columns(df):
     metrics = {"ratings": {}, "nps": {}, "responses": len(df), "json_dist": "{}"}
     dist_storage = {}
+    
     for col in df.columns:
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
+        
+        # Force numeric conversion for questions
         num = pd.to_numeric(df[col], errors='coerce')
-        if num.notna().sum() > (len(df)*0.1):
+        
+        if num.notna().sum() > (len(df)*0.1): # Valid numeric column
             avg = num.mean()
-            if 0<=avg<=5: 
+            
+            # 1-5 Scale Question
+            if 0 <= avg <= 5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
-                # ERROR FIX: Create clean dataframe with simple "Count" column to prevent Altair crashes
-                clean_dist = pd.DataFrame({"Count": counts.values}, index=counts.index.astype(str))
+                
+                # CRITICAL FIX: Create clean dataframe for plotting
+                # We rename columns to avoid special characters in charts
+                clean_dist = pd.DataFrame({
+                    "Rating": counts.index.astype(str), 
+                    "Count": counts.values
+                })
                 metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
                 
-                key_type = "Overall" if "overall" in clean else "Trainer" if "trainer" in clean else col
-                dist_storage[key_type] = counts.to_dict()
+                if "overall" in clean: key_type = "Overall"
+                elif "trainer" in clean: key_type = "Trainer"
+                else: key_type = col 
+                
+                dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
+                
+            # NPS Question
             if "recommend" in clean or "friend" in clean:
-                prom, det = ((num>=9).sum(), (num<=6).sum()) if num.max()>5 else ((num==5).sum(), (num<=3).sum())
-                metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
                 if num.max() > 5:
-                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(num.notna().sum() - prom - det)}
+                    prom = (num >= 9).sum()
+                    det = (num <= 6).sum()
+                    pas = (num == 7).sum() + (num == 8).sum()
+                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
+                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(pas)}
+                else:
+                    prom = (num == 5).sum()
+                    det = (num <= 3).sum()
+                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
+
     metrics["json_dist"] = json.dumps(dist_storage)
     return metrics
 
@@ -307,7 +332,11 @@ with tab_upload:
                             with cols[col_idx]:
                                 with st.container():
                                     st.caption(f"{q[:45]}...")
-                                    st.bar_chart(m["dist"], height=200, color="#4a90e2")
+                                    # Plotly Bar Chart (Crash-proof)
+                                    fig_bar = px.bar(m["dist"], x="Rating", y="Count", text="Count", template="plotly_white")
+                                    fig_bar.update_layout(height=180, margin=dict(l=0, r=0, t=0, b=0), xaxis_title=None, yaxis_title=None)
+                                    fig_bar.update_traces(marker_color="#4a90e2", textposition='auto')
+                                    st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
 
             if save_btn:
                 ws = connect_gsheet()
@@ -448,9 +477,16 @@ with tab_list:
                             if i < 3:
                                 with cols[i]:
                                     st.caption(f"{category}")
-                                    # Create clean DF for chart
-                                    df_d = pd.DataFrame.from_dict(values, orient='index', columns=['Count'])
-                                    st.bar_chart(df_d)
+                                    # Convert dict to DF for Plotly
+                                    df_d = pd.DataFrame(list(values.items()), columns=['Rating', 'Count'])
+                                    df_d['Rating'] = df_d['Rating'].astype(str)
+                                    df_d['Count'] = df_d['Count'].astype(int)
+                                    
+                                    # PLOTLY REPLACEMENT
+                                    fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", template="plotly_white")
+                                    fig_bar.update_layout(height=180, margin=dict(l=0, r=0, t=0, b=0), xaxis_title=None, yaxis_title=None)
+                                    fig_bar.update_traces(marker_color="#4a90e2", textposition='auto')
+                                    st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
                                 i += 1
                     except: st.caption("No detail data.")
                 else: st.caption("ℹ️ Detailed rating counts not saved.")
