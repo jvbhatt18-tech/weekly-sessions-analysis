@@ -45,6 +45,7 @@ def connect_gsheet():
         return None
 
 def get_history_df():
+    # No cache for instant updates
     ws = connect_gsheet()
     if not ws: return pd.DataFrame()
     data = ws.get_all_records()
@@ -163,6 +164,7 @@ def parse_attendee_smart(uploaded_file):
                     metrics["peak"] = peak
                     metrics["timeline"] = timeline
                     metrics["curve_str"] = compress_curve(timeline)
+                    # SMART STICKINESS: Last 10%
                     if not timeline.empty:
                         total_mins = len(timeline)
                         tail_mins = max(1, int(total_mins * 0.10))
@@ -191,22 +193,36 @@ def analyze_dynamic_columns(df):
     for col in df.columns:
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
+        
         num = pd.to_numeric(df[col], errors='coerce')
-        if num.notna().sum() > (len(df)*0.1):
+        if num.notna().sum() > (len(df)*0.1): # Valid numeric
             avg = num.mean()
-            if 0<=avg<=5: 
+            
+            # 1-5 Scale
+            if 0 <= avg <= 5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
                 clean_dist = pd.DataFrame({"Rating": counts.index.astype(str), "Count": counts.values})
                 metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
-                key_type = "Overall" if "overall" in clean else "Trainer" if "trainer" in clean else col
+                
+                if "overall" in clean: key_type = "Overall"
+                elif "trainer" in clean: key_type = "Trainer"
+                else: key_type = col 
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
+                
+            # NPS
             if "recommend" in clean or "friend" in clean:
-                prom, det = ((num>=9).sum(), (num<=6).sum()) if num.max()>5 else ((num==5).sum(), (num<=3).sum())
-                metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
                 if num.max() > 5:
+                    prom = (num >= 9).sum()
+                    det = (num <= 6).sum()
+                    pas = (num == 7).sum() + (num == 8).sum()
+                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
                     dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(pas)}
                 else:
+                    prom = (num == 5).sum()
+                    det = (num <= 3).sum()
+                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
                     dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det)}
+
     metrics["json_dist"] = json.dumps(dist_storage)
     return metrics
 
@@ -396,8 +412,8 @@ with tab_list:
                 with st.expander("ℹ️ How are these scores calculated?"):
                     st.markdown(r"""
                     **1. Stickiness Ratio (Magnetism)**
-                    * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
-                    * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
+                    * **Formula:** $\frac{\text{End Count (Last 10\%)}}{\text{Peak Count}} \times 100$
+                    * **What it means:** Of the people who showed up at the peak, how many stayed until the very end?
 
                     **2. Retention Score (Quality)**
                     * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
@@ -449,6 +465,7 @@ with tab_list:
                             if i < 3:
                                 with cols[i]:
                                     st.caption(f"{category}")
+                                    # Plotly replacement
                                     df_d = pd.DataFrame(list(values.items()), columns=['Rating', 'Count'])
                                     df_d['Rating'] = df_d['Rating'].astype(str)
                                     df_d['Count'] = df_d['Count'].astype(int)
@@ -477,7 +494,6 @@ with tab_analytics:
         trainer_col = next((c for c in df.columns if "Trainer" in c), None)
         rating_col = next((c for c in df.columns if "Overall" in c), None)
         type_col = next((c for c in df.columns if "Type" in c), None)
-        batch_col = next((c for c in df.columns if "Batch" in c), None)
         dur_col = next((c for c in df.columns if "Duration" in c), None)
         
         if date_col:
@@ -487,7 +503,7 @@ with tab_analytics:
             sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="exec_d")
             if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
             
-            # 1. TRAINER MATRIX
+            # 1. TRAINER MATRIX (TOP)
             if trainer_col and rating_col:
                 st.markdown("### 🏆 Trainer Matrix")
                 t_stats = df.groupby(trainer_col).agg(
@@ -531,7 +547,7 @@ with tab_analytics:
                 st.plotly_chart(fig_h, use_container_width=True)
             st.divider()
 
-            # 4. DURATION IMPACT (REMOVED TRENDLINE TO FIX CRASH)
+            # 4. DURATION IMPACT (CRASH FIXED)
             if dur_col and rating_col:
                 st.markdown("### ⏱️ Duration vs. Rating Impact")
                 fig_s = px.scatter(df, x=dur_col, y=rating_col, color=type_col if type_col else None, 
