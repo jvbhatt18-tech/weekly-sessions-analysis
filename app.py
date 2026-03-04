@@ -50,32 +50,43 @@ def connect_gsheet():
         st.error(f"❌ Sheet Connection Error: {e}")
         return None
 
-# 🔍 DEBUG MODE UPLOAD FUNCTION
-def upload_to_drive(file_objs, folder_name, date_str):
+def test_drive_connection():
+    """Diagnostic function to verify Drive access."""
     if "drive_folder_id" not in st.secrets:
-        st.error("❌ `drive_folder_id` is missing from secrets.")
-        return None
+        st.error("❌ Secrets Error: `drive_folder_id` is missing.")
+        return
     
-    parent_id = st.secrets["drive_folder_id"]
-    creds = get_creds()
+    folder_id = st.secrets["drive_folder_id"]
+    st.info(f"🕵️ Testing access to folder ID: `{folder_id}`...")
     
     try:
+        creds = get_creds()
         service = build('drive', 'v3', credentials=creds)
-        
-        # 1. VERIFY ACCESS (The "Can I see you?" test)
-        st.info(f"🕵️ Debug: Checking access to Folder ID `{parent_id}`...")
-        try:
-            folder_check = service.files().get(fileId=parent_id, fields="name, webViewLink").execute()
-            st.success(f"✅ Connected to Folder: **{folder_check.get('name')}**")
-        except Exception as e:
-            st.error(f"⛔ **ACCESS DENIED.** The bot cannot see the folder `{parent_id}`.")
-            st.warning("👉 Solution: Share the folder with the bot email again and ensure 'Editor' access.")
-            return None
+        # Try to get folder details
+        folder = service.files().get(fileId=folder_id, fields="name, webViewLink").execute()
+        st.success(f"✅ **SUCCESS!** Connected to folder: **'{folder.get('name')}'**")
+        st.markdown(f"🔗 [Click to Open Folder in Browser]({folder.get('webViewLink')})")
+    except Exception as e:
+        st.error("❌ **CONNECTION FAILED**")
+        st.error(f"Error Details: {str(e)}")
+        st.warning("""
+        **Troubleshooting Checklist:**
+        1. **Enable API:** Go to Google Cloud Console -> 'APIs & Services' -> 'Library' -> Search 'Google Drive API' -> Click **ENABLE**.
+        2. **Share Folder:** Ensure you shared the folder with the `client_email` found in your secrets (ends in `@...iam.gserviceaccount.com`).
+        3. **Editor Access:** Ensure the bot has 'Editor' permission, not just 'Viewer'.
+        """)
 
-        # 2. CREATE SUBFOLDER
+def upload_to_drive(file_objs, folder_name, date_str):
+    if "drive_folder_id" not in st.secrets:
+        return None
+    
+    creds = get_creds()
+    service = build('drive', 'v3', credentials=creds)
+    parent_id = st.secrets["drive_folder_id"]
+
+    try:
+        # 1. Create Sub-folder
         subfolder_name = f"{date_str} - {folder_name}"
-        st.info(f"📂 Creating subfolder: `{subfolder_name}`...")
-        
         file_metadata = {
             'name': subfolder_name,
             'mimeType': 'application/vnd.google-apps.folder',
@@ -84,24 +95,19 @@ def upload_to_drive(file_objs, folder_name, date_str):
         folder = service.files().create(body=file_metadata, fields='id, webViewLink').execute()
         folder_id = folder.get('id')
         folder_link = folder.get('webViewLink')
-        
-        st.success(f"✅ Subfolder created! ID: `{folder_id}`")
 
-        # 3. UPLOAD FILES
+        # 2. Upload Files
         for f in file_objs:
-            st.write(f"⬆️ Uploading: {f.name}...")
             f.seek(0)
             mimetype = f.type if hasattr(f, 'type') else 'text/plain'
             filename = f.name if hasattr(f, 'name') else 'unknown_file'
-            
             media = MediaIoBaseUpload(f, mimetype=mimetype, resumable=True)
             file_meta = {'name': filename, 'parents': [folder_id]}
             service.files().create(body=file_meta, media_body=media, fields='id').execute()
         
         return folder_link
-        
     except Exception as e:
-        st.error(f"❌ Drive API Error: {e}")
+        st.error(f"❌ Drive Upload Failed: {e}")
         return None
 
 def get_history_df():
@@ -110,7 +116,7 @@ def get_history_df():
     data = ws.get_all_records()
     return pd.DataFrame(data)
 
-# ─── PARSERS ───
+# ─── PARSERS (Standard) ───
 def calculate_precise_duration(intervals):
     if not intervals: return 0
     intervals.sort(key=lambda x: x[0])
@@ -236,10 +242,12 @@ def parse_poll_dynamic(uploaded_file):
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
+        
         data = [lines[h_idx]]
         for l in lines[h_idx+1:]:
             if "Feedback Poll" in l: break
             data.append(l)
+            
         df = pd.read_csv(io.StringIO("\n".join(data)), index_col=False)
         df.columns = [c.strip() for c in df.columns]
         return df
@@ -289,6 +297,12 @@ with tab_upload:
         st.header("2. Assets & Links")
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
         session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
+        
+        st.markdown("---")
+        # 🛠️ DIAGNOSTIC BUTTON
+        if st.button("🛠️ Test Drive Permissions"):
+            test_drive_connection()
+            
         st.markdown("---")
         st.header("3. Verify & Save")
         stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
@@ -296,6 +310,7 @@ with tab_upload:
             stats = parse_attendee_smart(attendee_file)
             if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
             elif stats["trainer"] != "Unknown": st.success(f"✅ Found: {stats['trainer']}")
+        
         session_date = st.date_input("Date", value=stats["date"])
         trainer_val = "Simulive Host" if stats["is_simulive"] else stats["trainer"]
         trainer = st.text_input("Trainer", value=trainer_val)
@@ -347,6 +362,7 @@ with tab_upload:
                 * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
                 * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
                 """)
+            
             st.write("")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Duration", mins_to_hhmm(duration))
@@ -382,6 +398,7 @@ with tab_upload:
                                     st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
 
             if save_btn:
+                # 1. SAVE TO GSHEET
                 ws = connect_gsheet()
                 if ws:
                     try:
@@ -390,6 +407,7 @@ with tab_upload:
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Stats Saved to Sheet!", icon="📊")
                         
+                        # 2. UPLOAD TO DRIVE
                         all_files_to_upload = [attendee_file] + poll_files + (asset_files if asset_files else [])
                         if session_links.strip():
                             link_file = io.BytesIO(session_links.encode('utf-8'))
@@ -400,10 +418,14 @@ with tab_upload:
                         folder_link = upload_to_drive(all_files_to_upload, title, date_str)
                         if folder_link:
                             st.success(f"✅ Files Uploaded! [**Click here to Open Drive Folder**]({folder_link})")
+                            st.info("ℹ️ Upload complete. Click 'Clear & New' below when ready.")
                         else:
-                            st.warning("⚠️ Stats saved, but Drive upload skipped (Check logs/permissions).")
+                            st.warning("⚠️ Stats saved, but Drive upload failed/skipped.")
                         
-                        st.session_state.upload_key += 1
+                        # NO AUTO-RERUN. User must click reset.
+                        if st.button("🔄 Clear & Start New Upload"):
+                            st.session_state.upload_key += 1
+                            st.rerun()
                         
                     except Exception as e: st.error(f"Error: {e}")
     else: st.info("👋 Go to Sidebar to Upload.")
@@ -481,7 +503,7 @@ with tab_list:
                 with st.expander("ℹ️ How are these scores calculated?"):
                     st.markdown(r"""
                     **1. Stickiness Ratio (Magnetism)**
-                    * **Formula:** $\frac{\text{End Count (Last 10\%)}}{\text{Peak Count}} \times 100$
+                    * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
                     * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
 
                     **2. Retention Score (Quality)**
