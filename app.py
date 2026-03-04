@@ -7,7 +7,6 @@ from googleapiclient.http import MediaIoBaseUpload
 from datetime import date
 import io
 import plotly.express as px
-import plotly.graph_objects as go
 import json
 
 # ─── 1. CONFIGURATION ───
@@ -55,7 +54,7 @@ def upload_to_drive(file_objs, folder_name, date_str):
     """Uploads files to a specific Google Drive folder."""
     if "drive_folder_id" not in st.secrets:
         st.warning("⚠️ Drive Upload Skipped: 'drive_folder_id' not found in secrets.")
-        return
+        return None
     
     creds = get_creds()
     service = build('drive', 'v3', credentials=creds)
@@ -63,25 +62,33 @@ def upload_to_drive(file_objs, folder_name, date_str):
 
     try:
         # 1. Create Session Sub-folder
-        folder_metadata = {
+        file_metadata = {
             'name': f"{date_str} - {folder_name}",
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [parent_id]
         }
-        folder = service.files().create(body=folder_metadata, fields='id').execute()
+        folder = service.files().create(body=file_metadata, fields='id, webViewLink').execute()
         folder_id = folder.get('id')
+        folder_link = folder.get('webViewLink')
 
         # 2. Upload Files
         for f in file_objs:
-            # Reset pointer to ensure full read
+            # Handle standard UploadedFile vs our custom Text Stream
             f.seek(0)
-            media = MediaIoBaseUpload(f, mimetype=f.type)
-            file_meta = {'name': f.name, 'parents': [folder_id]}
+            
+            # Determine mimetype
+            mimetype = f.type if hasattr(f, 'type') else 'text/plain'
+            filename = f.name if hasattr(f, 'name') else 'unknown_file'
+            
+            media = MediaIoBaseUpload(f, mimetype=mimetype)
+            file_meta = {'name': filename, 'parents': [folder_id]}
             service.files().create(body=file_meta, media_body=media, fields='id').execute()
         
-        st.toast(f"✅ Files uploaded to Drive folder: {date_str} - {folder_name}", icon="📂")
+        return folder_link
+        
     except Exception as e:
         st.error(f"❌ Drive Upload Error: {e}")
+        return None
 
 def get_history_df():
     ws = connect_gsheet()
@@ -277,12 +284,12 @@ with tab_upload:
     with st.sidebar:
         st.header("1. Upload Session Data")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
-        # CHANGED: Allow multiple polls and merge them later
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
         
         st.markdown("---")
-        st.header("2. Upload Assets (Drive)")
-        asset_files = st.file_uploader("Support Files (PDF, TXT, etc)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
+        st.header("2. Assets & Links")
+        asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
+        session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
         
         st.markdown("---")
         st.header("3. Verify & Save")
@@ -310,7 +317,6 @@ with tab_upload:
         st.markdown(f"**{title}**")
         st.divider()
 
-        # POLL MERGING LOGIC
         all_polls = []
         for p in poll_files:
             p_df = parse_poll_dynamic(p)
@@ -319,8 +325,6 @@ with tab_upload:
         
         if all_polls:
             df_poll = pd.concat(all_polls, ignore_index=True)
-            # Dedup if same user submitted multiple times? Optional. 
-            # For now, we treat every submission as valid feedback.
             data = analyze_dynamic_columns(df_poll)
             
             ov_key = next((k for k in data["ratings"] if "overall" in k.lower()), None)
@@ -392,12 +396,26 @@ with tab_upload:
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Stats Saved to Sheet!", icon="📊")
                         
-                        # 2. UPLOAD ASSETS TO DRIVE
+                        # 2. PREPARE FILES FOR DRIVE
                         all_files_to_upload = [attendee_file] + poll_files + (asset_files if asset_files else [])
-                        upload_to_drive(all_files_to_upload, title, date_str)
+                        
+                        # Add virtual file for links if present
+                        if session_links.strip():
+                            link_file = io.BytesIO(session_links.encode('utf-8'))
+                            link_file.name = "Session_Links.txt"
+                            link_file.type = "text/plain"
+                            all_files_to_upload.append(link_file)
+                        
+                        # 3. UPLOAD TO DRIVE
+                        folder_link = upload_to_drive(all_files_to_upload, title, date_str)
+                        if folder_link:
+                            st.success(f"✅ Files Uploaded! [**Click here to Open Drive Folder**]({folder_link})")
+                        else:
+                            st.warning("⚠️ Files uploaded (maybe), but link retrieval failed. Check Google Drive manually.")
                         
                         st.session_state.upload_key += 1
-                        st.rerun()
+                        # Note: We do NOT rerun immediately here so user can see the link
+                        
                     except Exception as e: st.error(f"Error: {e}")
     else: st.info("👋 Go to Sidebar to Upload.")
 
@@ -619,7 +637,6 @@ with tab_analytics:
                 days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 df['Day'] = pd.Categorical(df['Day'], categories=days_order, ordered=True)
                 
-                # Double aggregation for hover data
                 pivot_mean = df.pivot_table(index='Day', columns=type_col, values=rating_col, aggfunc='mean')
                 pivot_count = df.pivot_table(index='Day', columns=type_col, values=rating_col, aggfunc='count')
                 
@@ -630,7 +647,6 @@ with tab_analytics:
                     color_continuous_scale="RdYlGn", 
                     origin='lower'
                 )
-                # Add count data to hover
                 fig_h.update_traces(
                     customdata=pivot_count,
                     hovertemplate="<b>%{x}</b><br>Day: %{y}<br>Rating: %{z:.2f}<br>Sessions: %{customdata} <extra></extra>"
