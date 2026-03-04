@@ -11,6 +11,8 @@ import json
 
 # ─── 1. CONFIGURATION ───
 SHEET_ID = "1jYRJe9APAlIZdMQ9svuOo9gR1DbYfrCUjThvtO1DXcI"
+# Hardcoded to prevent Secrets errors
+DRIVE_FOLDER_ID = "1u72SsXi7OPH-QTL9Rk82shYHEFQImnWJ"
 
 st.set_page_config(page_title="Weekly Sessions Command Center", page_icon="🚀", layout="wide")
 
@@ -50,64 +52,47 @@ def connect_gsheet():
         st.error(f"❌ Sheet Connection Error: {e}")
         return None
 
-def test_drive_connection():
-    """Diagnostic function to verify Drive access."""
-    if "drive_folder_id" not in st.secrets:
-        st.error("❌ Secrets Error: `drive_folder_id` is missing.")
-        return
-    
-    folder_id = st.secrets["drive_folder_id"]
-    st.info(f"🕵️ Testing access to folder ID: `{folder_id}`...")
-    
-    try:
-        creds = get_creds()
-        service = build('drive', 'v3', credentials=creds)
-        # Try to get folder details
-        folder = service.files().get(fileId=folder_id, fields="name, webViewLink").execute()
-        st.success(f"✅ **SUCCESS!** Connected to folder: **'{folder.get('name')}'**")
-        st.markdown(f"🔗 [Click to Open Folder in Browser]({folder.get('webViewLink')})")
-    except Exception as e:
-        st.error("❌ **CONNECTION FAILED**")
-        st.error(f"Error Details: {str(e)}")
-        st.warning("""
-        **Troubleshooting Checklist:**
-        1. **Enable API:** Go to Google Cloud Console -> 'APIs & Services' -> 'Library' -> Search 'Google Drive API' -> Click **ENABLE**.
-        2. **Share Folder:** Ensure you shared the folder with the `client_email` found in your secrets (ends in `@...iam.gserviceaccount.com`).
-        3. **Editor Access:** Ensure the bot has 'Editor' permission, not just 'Viewer'.
-        """)
-
 def upload_to_drive(file_objs, folder_name, date_str):
-    if "drive_folder_id" not in st.secrets:
-        return None
-    
+    """Robust Upload Function using Global ID"""
     creds = get_creds()
-    service = build('drive', 'v3', credentials=creds)
-    parent_id = st.secrets["drive_folder_id"]
-
+    if not creds: return None
+    
     try:
-        # 1. Create Sub-folder
+        service = build('drive', 'v3', credentials=creds)
+        
+        # 1. Create Session Sub-folder
+        # We explicitly set the parent to DRIVE_FOLDER_ID
         subfolder_name = f"{date_str} - {folder_name}"
         file_metadata = {
             'name': subfolder_name,
             'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [parent_id]
+            'parents': [DRIVE_FOLDER_ID] 
         }
+        
+        # Execute and explicitly request webViewLink
         folder = service.files().create(body=file_metadata, fields='id, webViewLink').execute()
         folder_id = folder.get('id')
         folder_link = folder.get('webViewLink')
+        
+        print(f"✅ Folder Created: {subfolder_name} (ID: {folder_id})")
 
-        # 2. Upload Files
+        # 2. Upload Files into that new subfolder
         for f in file_objs:
-            f.seek(0)
+            f.seek(0) # Reset file pointer
             mimetype = f.type if hasattr(f, 'type') else 'text/plain'
             filename = f.name if hasattr(f, 'name') else 'unknown_file'
+            
             media = MediaIoBaseUpload(f, mimetype=mimetype, resumable=True)
             file_meta = {'name': filename, 'parents': [folder_id]}
+            
             service.files().create(body=file_meta, media_body=media, fields='id').execute()
+            print(f"✅ File Uploaded: {filename}")
         
         return folder_link
+        
     except Exception as e:
-        st.error(f"❌ Drive Upload Failed: {e}")
+        st.error(f"❌ Drive Upload Error: {e}")
+        print(f"❌ Drive Error: {e}")
         return None
 
 def get_history_df():
@@ -116,7 +101,7 @@ def get_history_df():
     data = ws.get_all_records()
     return pd.DataFrame(data)
 
-# ─── PARSERS (Standard) ───
+# ─── PARSERS ───
 def calculate_precise_duration(intervals):
     if not intervals: return 0
     intervals.sort(key=lambda x: x[0])
@@ -242,12 +227,10 @@ def parse_poll_dynamic(uploaded_file):
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
-        
         data = [lines[h_idx]]
         for l in lines[h_idx+1:]:
             if "Feedback Poll" in l: break
             data.append(l)
-            
         df = pd.read_csv(io.StringIO("\n".join(data)), index_col=False)
         df.columns = [c.strip() for c in df.columns]
         return df
@@ -262,7 +245,8 @@ def analyze_dynamic_columns(df):
         num = pd.to_numeric(df[col], errors='coerce')
         if num.notna().sum() > (len(df)*0.1): # Valid numeric
             avg = num.mean()
-            if 0<=avg<=5: 
+            # 1-5 Scale
+            if 0 <= avg <= 5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
                 clean_dist = pd.DataFrame({"Rating": counts.index.astype(str), "Count": counts.values})
                 metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
@@ -270,12 +254,18 @@ def analyze_dynamic_columns(df):
                 elif "trainer" in clean: key_type = "Trainer"
                 else: key_type = col 
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
+            # NPS
             if "recommend" in clean or "friend" in clean:
-                prom, det = ((num>=9).sum(), (num<=6).sum()) if num.max()>5 else ((num==5).sum(), (num<=3).sum())
-                metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
                 if num.max() > 5:
-                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(num.notna().sum() - prom - det)}
+                    prom = (num >= 9).sum()
+                    det = (num <= 6).sum()
+                    pas = (num == 7).sum() + (num == 8).sum()
+                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
+                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(pas)}
                 else:
+                    prom = (num == 5).sum()
+                    det = (num <= 3).sum()
+                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
                     dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det)}
     metrics["json_dist"] = json.dumps(dist_storage)
     return metrics
@@ -299,18 +289,12 @@ with tab_upload:
         session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
         
         st.markdown("---")
-        # 🛠️ DIAGNOSTIC BUTTON
-        if st.button("🛠️ Test Drive Permissions"):
-            test_drive_connection()
-            
-        st.markdown("---")
         st.header("3. Verify & Save")
         stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
         if attendee_file:
             stats = parse_attendee_smart(attendee_file)
             if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
             elif stats["trainer"] != "Unknown": st.success(f"✅ Found: {stats['trainer']}")
-        
         session_date = st.date_input("Date", value=stats["date"])
         trainer_val = "Simulive Host" if stats["is_simulive"] else stats["trainer"]
         trainer = st.text_input("Trainer", value=trainer_val)
@@ -362,7 +346,6 @@ with tab_upload:
                 * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
                 * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
                 """)
-            
             st.write("")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Duration", mins_to_hhmm(duration))
@@ -398,7 +381,6 @@ with tab_upload:
                                     st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
 
             if save_btn:
-                # 1. SAVE TO GSHEET
                 ws = connect_gsheet()
                 if ws:
                     try:
@@ -407,7 +389,6 @@ with tab_upload:
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Stats Saved to Sheet!", icon="📊")
                         
-                        # 2. UPLOAD TO DRIVE
                         all_files_to_upload = [attendee_file] + poll_files + (asset_files if asset_files else [])
                         if session_links.strip():
                             link_file = io.BytesIO(session_links.encode('utf-8'))
@@ -422,7 +403,6 @@ with tab_upload:
                         else:
                             st.warning("⚠️ Stats saved, but Drive upload failed/skipped.")
                         
-                        # NO AUTO-RERUN. User must click reset.
                         if st.button("🔄 Clear & Start New Upload"):
                             st.session_state.upload_key += 1
                             st.rerun()
@@ -556,6 +536,7 @@ with tab_list:
                             if i < 3:
                                 with cols[i]:
                                     st.caption(f"{category}")
+                                    # Plotly replacement
                                     df_d = pd.DataFrame(list(values.items()), columns=['Rating', 'Count'])
                                     df_d['Rating'] = df_d['Rating'].astype(str)
                                     df_d['Count'] = df_d['Count'].astype(int)
