@@ -50,24 +50,39 @@ def connect_gsheet():
         st.error(f"❌ Sheet Connection Error: {e}")
         return None
 
-# 🧠 SMART SECRET FINDER (Kept as safety net)
-def get_drive_folder_id():
-    # 1. Check Top Level
-    if "drive_folder_id" in st.secrets:
-        return st.secrets["drive_folder_id"]
-    # 2. Check Nested
-    if "gcp_service_account" in st.secrets and "drive_folder_id" in st.secrets["gcp_service_account"]:
-        return st.secrets["gcp_service_account"]["drive_folder_id"]
-    return None
+def test_drive_connection():
+    """Diagnostic function to verify Drive access."""
+    if "drive_folder_id" not in st.secrets:
+        st.error("❌ Secrets Error: `drive_folder_id` is missing.")
+        return
+    
+    folder_id = st.secrets["drive_folder_id"]
+    st.info(f"🕵️ Testing access to folder ID: `{folder_id}`...")
+    
+    try:
+        creds = get_creds()
+        service = build('drive', 'v3', credentials=creds)
+        # Try to get folder details
+        folder = service.files().get(fileId=folder_id, fields="name, webViewLink").execute()
+        st.success(f"✅ **SUCCESS!** Connected to folder: **'{folder.get('name')}'**")
+        st.markdown(f"🔗 [Click to Open Folder in Browser]({folder.get('webViewLink')})")
+    except Exception as e:
+        st.error("❌ **CONNECTION FAILED**")
+        st.error(f"Error Details: {str(e)}")
+        st.warning("""
+        **Troubleshooting Checklist:**
+        1. **Enable API:** Go to Google Cloud Console -> 'APIs & Services' -> 'Library' -> Search 'Google Drive API' -> Click **ENABLE**.
+        2. **Share Folder:** Ensure you shared the folder with the `client_email` found in your secrets (ends in `@...iam.gserviceaccount.com`).
+        3. **Editor Access:** Ensure the bot has 'Editor' permission, not just 'Viewer'.
+        """)
 
 def upload_to_drive(file_objs, folder_name, date_str):
-    folder_id = get_drive_folder_id()
-    if not folder_id:
-        st.error("❌ Drive Folder ID not found in secrets.")
+    if "drive_folder_id" not in st.secrets:
         return None
     
     creds = get_creds()
     service = build('drive', 'v3', credentials=creds)
+    parent_id = st.secrets["drive_folder_id"]
 
     try:
         # 1. Create Sub-folder
@@ -75,10 +90,10 @@ def upload_to_drive(file_objs, folder_name, date_str):
         file_metadata = {
             'name': subfolder_name,
             'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [folder_id]
+            'parents': [parent_id]
         }
         folder = service.files().create(body=file_metadata, fields='id, webViewLink').execute()
-        created_id = folder.get('id')
+        folder_id = folder.get('id')
         folder_link = folder.get('webViewLink')
 
         # 2. Upload Files
@@ -87,7 +102,7 @@ def upload_to_drive(file_objs, folder_name, date_str):
             mimetype = f.type if hasattr(f, 'type') else 'text/plain'
             filename = f.name if hasattr(f, 'name') else 'unknown_file'
             media = MediaIoBaseUpload(f, mimetype=mimetype, resumable=True)
-            file_meta = {'name': filename, 'parents': [created_id]}
+            file_meta = {'name': filename, 'parents': [folder_id]}
             service.files().create(body=file_meta, media_body=media, fields='id').execute()
         
         return folder_link
@@ -101,7 +116,7 @@ def get_history_df():
     data = ws.get_all_records()
     return pd.DataFrame(data)
 
-# ─── PARSERS ───
+# ─── PARSERS (Standard) ───
 def calculate_precise_duration(intervals):
     if not intervals: return 0
     intervals.sort(key=lambda x: x[0])
@@ -227,10 +242,12 @@ def parse_poll_dynamic(uploaded_file):
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
+        
         data = [lines[h_idx]]
         for l in lines[h_idx+1:]:
             if "Feedback Poll" in l: break
             data.append(l)
+            
         df = pd.read_csv(io.StringIO("\n".join(data)), index_col=False)
         df.columns = [c.strip() for c in df.columns]
         return df
@@ -243,10 +260,9 @@ def analyze_dynamic_columns(df):
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
         num = pd.to_numeric(df[col], errors='coerce')
-        if num.notna().sum() > (len(df)*0.1): 
+        if num.notna().sum() > (len(df)*0.1): # Valid numeric
             avg = num.mean()
-            # 1-5 Scale
-            if 0 <= avg <= 5: 
+            if 0<=avg<=5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
                 clean_dist = pd.DataFrame({"Rating": counts.index.astype(str), "Count": counts.values})
                 metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
@@ -254,18 +270,12 @@ def analyze_dynamic_columns(df):
                 elif "trainer" in clean: key_type = "Trainer"
                 else: key_type = col 
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
-            # NPS
             if "recommend" in clean or "friend" in clean:
+                prom, det = ((num>=9).sum(), (num<=6).sum()) if num.max()>5 else ((num==5).sum(), (num<=3).sum())
+                metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
                 if num.max() > 5:
-                    prom = (num >= 9).sum()
-                    det = (num <= 6).sum()
-                    pas = (num == 7).sum() + (num == 8).sum()
-                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
-                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(pas)}
+                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(num.notna().sum() - prom - det)}
                 else:
-                    prom = (num == 5).sum()
-                    det = (num <= 3).sum()
-                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
                     dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det)}
     metrics["json_dist"] = json.dumps(dist_storage)
     return metrics
@@ -288,6 +298,11 @@ with tab_upload:
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
         session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
         
+        st.markdown("---")
+        # 🛠️ DIAGNOSTIC BUTTON
+        if st.button("🛠️ Test Drive Permissions"):
+            test_drive_connection()
+            
         st.markdown("---")
         st.header("3. Verify & Save")
         stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
@@ -407,7 +422,7 @@ with tab_upload:
                         else:
                             st.warning("⚠️ Stats saved, but Drive upload failed/skipped.")
                         
-                        # Manual Reset Button
+                        # NO AUTO-RERUN. User must click reset.
                         if st.button("🔄 Clear & Start New Upload"):
                             st.session_state.upload_key += 1
                             st.rerun()
