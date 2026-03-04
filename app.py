@@ -50,44 +50,58 @@ def connect_gsheet():
         st.error(f"❌ Sheet Connection Error: {e}")
         return None
 
+# 🔍 DEBUG MODE UPLOAD FUNCTION
 def upload_to_drive(file_objs, folder_name, date_str):
-    """Uploads files to a specific Google Drive folder."""
     if "drive_folder_id" not in st.secrets:
-        st.warning("⚠️ Drive Upload Skipped: 'drive_folder_id' not found in secrets.")
+        st.error("❌ `drive_folder_id` is missing from secrets.")
         return None
     
-    creds = get_creds()
-    service = build('drive', 'v3', credentials=creds)
     parent_id = st.secrets["drive_folder_id"]
-
+    creds = get_creds()
+    
     try:
-        # 1. Create Session Sub-folder
+        service = build('drive', 'v3', credentials=creds)
+        
+        # 1. VERIFY ACCESS (The "Can I see you?" test)
+        st.info(f"🕵️ Debug: Checking access to Folder ID `{parent_id}`...")
+        try:
+            folder_check = service.files().get(fileId=parent_id, fields="name, webViewLink").execute()
+            st.success(f"✅ Connected to Folder: **{folder_check.get('name')}**")
+        except Exception as e:
+            st.error(f"⛔ **ACCESS DENIED.** The bot cannot see the folder `{parent_id}`.")
+            st.warning("👉 Solution: Share the folder with the bot email again and ensure 'Editor' access.")
+            return None
+
+        # 2. CREATE SUBFOLDER
+        subfolder_name = f"{date_str} - {folder_name}"
+        st.info(f"📂 Creating subfolder: `{subfolder_name}`...")
+        
         file_metadata = {
-            'name': f"{date_str} - {folder_name}",
+            'name': subfolder_name,
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [parent_id]
         }
         folder = service.files().create(body=file_metadata, fields='id, webViewLink').execute()
         folder_id = folder.get('id')
         folder_link = folder.get('webViewLink')
+        
+        st.success(f"✅ Subfolder created! ID: `{folder_id}`")
 
-        # 2. Upload Files
+        # 3. UPLOAD FILES
         for f in file_objs:
-            # Handle standard UploadedFile vs our custom Text Stream
+            st.write(f"⬆️ Uploading: {f.name}...")
             f.seek(0)
-            
-            # Determine mimetype
             mimetype = f.type if hasattr(f, 'type') else 'text/plain'
             filename = f.name if hasattr(f, 'name') else 'unknown_file'
             
-            media = MediaIoBaseUpload(f, mimetype=mimetype)
+            media = MediaIoBaseUpload(f, mimetype=mimetype, resumable=True)
             file_meta = {'name': filename, 'parents': [folder_id]}
             service.files().create(body=file_meta, media_body=media, fields='id').execute()
         
         return folder_link
         
     except Exception as e:
-        st.error(f"❌ Drive Upload Error: {e}")
+        st.error(f"❌ Drive API Error: {e}")
         return None
 
 def get_history_df():
@@ -222,12 +236,10 @@ def parse_poll_dynamic(uploaded_file):
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
-        
         data = [lines[h_idx]]
         for l in lines[h_idx+1:]:
             if "Feedback Poll" in l: break
             data.append(l)
-            
         df = pd.read_csv(io.StringIO("\n".join(data)), index_col=False)
         df.columns = [c.strip() for c in df.columns]
         return df
@@ -239,36 +251,24 @@ def analyze_dynamic_columns(df):
     for col in df.columns:
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
-        
         num = pd.to_numeric(df[col], errors='coerce')
         if num.notna().sum() > (len(df)*0.1): # Valid numeric
             avg = num.mean()
-            
-            # 1-5 Scale
-            if 0 <= avg <= 5: 
+            if 0<=avg<=5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
                 clean_dist = pd.DataFrame({"Rating": counts.index.astype(str), "Count": counts.values})
                 metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
-                
                 if "overall" in clean: key_type = "Overall"
                 elif "trainer" in clean: key_type = "Trainer"
                 else: key_type = col 
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
-                
-            # NPS
             if "recommend" in clean or "friend" in clean:
+                prom, det = ((num>=9).sum(), (num<=6).sum()) if num.max()>5 else ((num==5).sum(), (num<=3).sum())
+                metrics["nps"][col] = round(((prom-det)/num.notna().sum())*100)
                 if num.max() > 5:
-                    prom = (num >= 9).sum()
-                    det = (num <= 6).sum()
-                    pas = (num == 7).sum() + (num == 8).sum()
-                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
-                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(pas)}
+                    dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det), "Passives": int(num.notna().sum() - prom - det)}
                 else:
-                    prom = (num == 5).sum()
-                    det = (num <= 3).sum()
-                    metrics["nps"][col] = round(((prom - det) / num.notna().sum()) * 100)
                     dist_storage["NPS"] = {"Promoters": int(prom), "Detractors": int(det)}
-
     metrics["json_dist"] = json.dumps(dist_storage)
     return metrics
 
@@ -285,12 +285,10 @@ with tab_upload:
         st.header("1. Upload Session Data")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
-        
         st.markdown("---")
         st.header("2. Assets & Links")
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
         session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
-        
         st.markdown("---")
         st.header("3. Verify & Save")
         stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
@@ -298,7 +296,6 @@ with tab_upload:
             stats = parse_attendee_smart(attendee_file)
             if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
             elif stats["trainer"] != "Unknown": st.success(f"✅ Found: {stats['trainer']}")
-        
         session_date = st.date_input("Date", value=stats["date"])
         trainer_val = "Simulive Host" if stats["is_simulive"] else stats["trainer"]
         trainer = st.text_input("Trainer", value=trainer_val)
@@ -326,7 +323,6 @@ with tab_upload:
         if all_polls:
             df_poll = pd.concat(all_polls, ignore_index=True)
             data = analyze_dynamic_columns(df_poll)
-            
             ov_key = next((k for k in data["ratings"] if "overall" in k.lower()), None)
             tr_key = next((k for k in data["ratings"] if "trainer" in k.lower()), None)
             ov_val = data["ratings"][ov_key]["avg"] if ov_key else 0
@@ -351,7 +347,6 @@ with tab_upload:
                 * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
                 * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
                 """)
-            
             st.write("")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Duration", mins_to_hhmm(duration))
@@ -387,7 +382,6 @@ with tab_upload:
                                     st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
 
             if save_btn:
-                # 1. SAVE TO GSHEET
                 ws = connect_gsheet()
                 if ws:
                     try:
@@ -396,25 +390,20 @@ with tab_upload:
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         st.toast("✅ Stats Saved to Sheet!", icon="📊")
                         
-                        # 2. PREPARE FILES FOR DRIVE
                         all_files_to_upload = [attendee_file] + poll_files + (asset_files if asset_files else [])
-                        
-                        # Add virtual file for links if present
                         if session_links.strip():
                             link_file = io.BytesIO(session_links.encode('utf-8'))
                             link_file.name = "Session_Links.txt"
                             link_file.type = "text/plain"
                             all_files_to_upload.append(link_file)
                         
-                        # 3. UPLOAD TO DRIVE
                         folder_link = upload_to_drive(all_files_to_upload, title, date_str)
                         if folder_link:
                             st.success(f"✅ Files Uploaded! [**Click here to Open Drive Folder**]({folder_link})")
                         else:
-                            st.warning("⚠️ Files uploaded (maybe), but link retrieval failed. Check Google Drive manually.")
+                            st.warning("⚠️ Stats saved, but Drive upload skipped (Check logs/permissions).")
                         
                         st.session_state.upload_key += 1
-                        # Note: We do NOT rerun immediately here so user can see the link
                         
                     except Exception as e: st.error(f"Error: {e}")
     else: st.info("👋 Go to Sidebar to Upload.")
@@ -492,7 +481,7 @@ with tab_list:
                 with st.expander("ℹ️ How are these scores calculated?"):
                     st.markdown(r"""
                     **1. Stickiness Ratio (Magnetism)**
-                    * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
+                    * **Formula:** $\frac{\text{End Count (Last 10\%)}}{\text{Peak Count}} \times 100$
                     * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
 
                     **2. Retention Score (Quality)**
