@@ -99,7 +99,6 @@ def parse_attendee_smart(uploaded_file):
         content = uploaded_file.getvalue().decode("utf-8", errors='replace')
         lines = content.splitlines()
         
-        # Metadata
         for line in lines[:5]:
             if "Topic" in line and "Start Time" in line:
                 try:
@@ -109,7 +108,6 @@ def parse_attendee_smart(uploaded_file):
                 except: pass
                 break
         
-        # Simulive Detection
         tail_lines = lines[-30:] if len(lines) > 30 else lines
         for line in tail_lines:
             if "Presenter" in line:
@@ -121,13 +119,11 @@ def parse_attendee_smart(uploaded_file):
                 except: pass
                 break
 
-        # Sections
         p_start, a_start = -1, -1
         for i, line in enumerate(lines):
             if "Panelist Details" in line: p_start = i
             if "Attendee Details" in line: a_start = i
         
-        # Trainer
         if p_start != -1 and not metrics["is_simulive"]:
             chunk = lines[p_start+1:a_start if a_start!=-1 else len(lines)]
             p_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Join Time" in l), -1)
@@ -150,7 +146,6 @@ def parse_attendee_smart(uploaded_file):
                         stats.sort(key=lambda x: x[1], reverse=True)
                         metrics["trainer"], metrics["duration"] = stats[0]
         
-        # Attendees
         if a_start != -1:
             chunk = lines[a_start+1:]
             a_head = next((j for j, l in enumerate(chunk) if "User Name" in l and "Email" in l), -1)
@@ -168,9 +163,11 @@ def parse_attendee_smart(uploaded_file):
                     metrics["peak"] = peak
                     metrics["timeline"] = timeline
                     metrics["curve_str"] = compress_curve(timeline)
+                    # KEEPING YOUR PREVIOUS LOGIC (Last 15 mins approx)
                     if not timeline.empty:
-                        metrics["end_count"] = timeline.iloc[-16:-1]["Attendees"].mean() if len(timeline)>15 else timeline.iloc[-1]["Attendees"]
-                        metrics["stickiness"] = (timeline.iloc[len(timeline)//2]["Attendees"] / peak) if peak > 0 else 0
+                        end_slice = timeline.iloc[-16:-1] if len(timeline)>15 else timeline.iloc[-1]
+                        metrics["end_count"] = end_slice["Attendees"].mean() if len(timeline)>15 else end_slice["Attendees"]
+                        metrics["stickiness"] = (metrics["end_count"] / peak) if peak > 0 else 0
     except: pass
     return metrics
 
@@ -212,19 +209,17 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 Recent Sessions", "📊 Dashboard", "📉 Retention Lab"])
+tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 History & Details", "📊 Dashboard", "📉 Retention Lab"])
 
 # ==========================================
 # TAB 1: UPLOAD
 # ==========================================
 with tab_upload:
     if "upload_key" not in st.session_state: st.session_state.upload_key = 0
-
     with st.sidebar:
         st.header("1. Upload")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
-        
         st.markdown("---")
         st.header("2. Verify")
         stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
@@ -267,7 +262,21 @@ with tab_upload:
 
             sc1, sc2 = st.columns(2)
             sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{trainer_score:.2f}</div><div class="score-sub">Retained {int(ret_rate*100)}% × Rating {tr_val}</div></div>""", unsafe_allow_html=True)
-            sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stats["stickiness"]*100)}%</div><div class="score-sub">Audience remaining at half-time</div></div>""", unsafe_allow_html=True)
+            sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stats["stickiness"]*100)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+            
+            # 🔴 POPUP EXPLANATION 🔴
+            with st.expander("ℹ️ How are these scores calculated?"):
+                st.markdown(r"""
+                **1. Stickiness Ratio (Magnetism)**
+                * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
+                * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
+
+                **2. Retention Score (Quality)**
+                * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
+                * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
+                * **Example:** Rating **4.5** $\times$ Stickiness **0.80** (80%) = **3.6** Score.
+                """)
+            
             st.write("")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Duration", mins_to_hhmm(duration))
@@ -373,6 +382,26 @@ with tab_list:
                 tr_rate = safe_get(row, tr_rating_col)
                 duration = safe_get(row, dur_col)
                 
+                stickiness = (end / peak * 100) if peak > 0 else 0
+                ret_score = (end/peak * ov_rate) if peak > 0 else 0
+
+                sc1, sc2 = st.columns(2)
+                sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{ret_score:.2f}</div></div>""", unsafe_allow_html=True)
+                sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+                
+                # 🔴 POPUP EXPLANATION (Copy for Tab 2) 🔴
+                with st.expander("ℹ️ How are these scores calculated?"):
+                    st.markdown(r"""
+                    **1. Stickiness Ratio (Magnetism)**
+                    * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
+                    * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
+
+                    **2. Retention Score (Quality)**
+                    * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
+                    * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
+                    """)
+                st.write("")
+
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Overall Rating", f"{ov_rate:.2f}" if ov_rate else "-")
                 m2.metric("Trainer Rating", f"{tr_rate:.2f}" if tr_rate else "-")
