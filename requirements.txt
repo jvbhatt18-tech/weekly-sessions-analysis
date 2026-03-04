@@ -4,3 +4,4 @@ gspread
 google-auth
 plotly
 openpyxl
+google-api-python-client
