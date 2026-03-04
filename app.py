@@ -45,6 +45,7 @@ def connect_gsheet():
         return None
 
 def get_history_df():
+    # No cache for instant updates
     ws = connect_gsheet()
     if not ws: return pd.DataFrame()
     data = ws.get_all_records()
@@ -163,10 +164,11 @@ def parse_attendee_smart(uploaded_file):
                     metrics["peak"] = peak
                     metrics["timeline"] = timeline
                     metrics["curve_str"] = compress_curve(timeline)
-                    # KEEPING YOUR PREVIOUS LOGIC (Last 15 mins approx)
                     if not timeline.empty:
-                        end_slice = timeline.iloc[-16:-1] if len(timeline)>15 else timeline.iloc[-1]
-                        metrics["end_count"] = end_slice["Attendees"].mean() if len(timeline)>15 else end_slice["Attendees"]
+                        # Smart Stickiness: Last 10% average
+                        total_mins = len(timeline)
+                        tail_mins = max(1, int(total_mins * 0.10))
+                        metrics["end_count"] = timeline.iloc[-tail_mins:]["Attendees"].mean()
                         metrics["stickiness"] = (metrics["end_count"] / peak) if peak > 0 else 0
     except: pass
     return metrics
@@ -196,7 +198,10 @@ def analyze_dynamic_columns(df):
             avg = num.mean()
             if 0<=avg<=5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
-                metrics["ratings"][col] = {"avg": round(avg, 2), "dist": counts}
+                # ERROR FIX: Create clean dataframe with simple "Count" column to prevent Altair crashes
+                clean_dist = pd.DataFrame({"Count": counts.values}, index=counts.index.astype(str))
+                metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
+                
                 key_type = "Overall" if "overall" in clean else "Trainer" if "trainer" in clean else col
                 dist_storage[key_type] = counts.to_dict()
             if "recommend" in clean or "friend" in clean:
@@ -209,7 +214,7 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 History & Details", "📊 Dashboard", "📉 Retention Lab"])
+tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 Recent Sessions", "📊 Dashboard", "📉 Retention Lab"])
 
 # ==========================================
 # TAB 1: UPLOAD
@@ -264,17 +269,15 @@ with tab_upload:
             sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{trainer_score:.2f}</div><div class="score-sub">Retained {int(ret_rate*100)}% × Rating {tr_val}</div></div>""", unsafe_allow_html=True)
             sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stats["stickiness"]*100)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
             
-            # 🔴 POPUP EXPLANATION 🔴
             with st.expander("ℹ️ How are these scores calculated?"):
                 st.markdown(r"""
                 **1. Stickiness Ratio (Magnetism)**
-                * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
-                * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
+                * **Formula:** $\frac{\text{End Count (Last 10\%)}}{\text{Peak Count}} \times 100$
+                * **What it means:** Of the people who showed up at the peak, how many stayed until the very end?
 
                 **2. Retention Score (Quality)**
                 * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
                 * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
-                * **Example:** Rating **4.5** $\times$ Stickiness **0.80** (80%) = **3.6** Score.
                 """)
             
             st.write("")
@@ -389,7 +392,6 @@ with tab_list:
                 sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{ret_score:.2f}</div></div>""", unsafe_allow_html=True)
                 sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
                 
-                # 🔴 POPUP EXPLANATION (Copy for Tab 2) 🔴
                 with st.expander("ℹ️ How are these scores calculated?"):
                     st.markdown(r"""
                     **1. Stickiness Ratio (Magnetism)**
@@ -446,6 +448,7 @@ with tab_list:
                             if i < 3:
                                 with cols[i]:
                                     st.caption(f"{category}")
+                                    # Create clean DF for chart
                                     df_d = pd.DataFrame.from_dict(values, orient='index', columns=['Count'])
                                     st.bar_chart(df_d)
                                 i += 1
