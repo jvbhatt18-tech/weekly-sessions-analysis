@@ -4,39 +4,53 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 from datetime import date
 import io
 import plotly.express as px
+import plotly.graph_objects as go
 import json
+import time
 
 # ─── 1. CONFIGURATION ───
 SHEET_ID = "1jYRJe9APAlIZdMQ9svuOo9gR1DbYfrCUjThvtO1DXcI"
-# Hardcoded to prevent Secrets errors
-DRIVE_FOLDER_ID = "1u72SsXi7OPH-QTL9Rk82shYHEFQImnWJ"
+DRIVE_FOLDER_ID = "0ADZkkxHLwZa9Uk9PVA"  # Shared Drive ID
 
-st.set_page_config(page_title="Weekly Sessions Command Center", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Session Command Center", page_icon="🚀", layout="wide")
 
-# ─── Custom CSS ────────────────────────────────────────────────────────────────
+# ─── PREMIUM UI STYLING ───
 st.markdown("""
 <style>
-    [data-testid="stAppViewContainer"] { background-color: #f8f9fa; }
-    [data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e0e0e0; }
-    div[data-testid="stMetric"] { background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); text-align: center; }
-    .score-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 10px; }
-    .score-val { font-size: 2.2rem; font-weight: 800; margin: 0; }
-    .score-label { font-size: 0.85rem; opacity: 0.9; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+    .main { background-color: #f8f9fa; }
+    div.block-container { padding-top: 2rem; }
+    div[data-testid="stMetric"] { background-color: white; border: 1px solid #e0e0e0; border-radius: 10px; padding: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+    .score-card { 
+        background: linear-gradient(135deg, #2c3e50 0%, #4ca1af 100%); 
+        color: white; border-radius: 15px; padding: 20px; text-align: center; 
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin-bottom: 20px; 
+    }
+    .score-val { font-size: 2.5rem; font-weight: 800; margin: 0; }
+    .score-label { font-size: 0.9rem; opacity: 0.95; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+    .score-sub { font-size: 0.8rem; opacity: 0.85; margin-top: 5px; font-style: italic; }
     .stDataFrame { background-color: white; border-radius: 10px; padding: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── CONNECTIONS ───
+# ─── STATE MANAGEMENT ───
+if "upload_key" not in st.session_state: st.session_state.upload_key = 0
+
+def reset_app():
+    st.session_state.upload_key += 1
+
 def mins_to_hhmm(minutes):
     try:
         m = int(minutes)
         return f"{m // 60}h {m % 60:02d}m"
     except: return "0h 00m"
 
-def get_creds():
+# ─── CONNECTIONS (Cached) ───
+@st.cache_resource
+def get_gcp_creds():
     if "gcp_service_account" not in st.secrets: 
         st.error("❌ Secrets not found.")
         return None
@@ -44,7 +58,7 @@ def get_creds():
     return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
 
 def connect_gsheet():
-    creds = get_creds()
+    creds = get_gcp_creds()
     if not creds: return None
     gc = gspread.authorize(creds)
     try: return gc.open_by_key(SHEET_ID).sheet1
@@ -52,47 +66,73 @@ def connect_gsheet():
         st.error(f"❌ Sheet Connection Error: {e}")
         return None
 
-def upload_to_drive(file_objs, folder_name, date_str):
-    """Robust Upload Function using Global ID"""
-    creds = get_creds()
+def upload_to_drive_robust(file_objs, folder_name, date_str, status_container, progress_bar):
+    creds = get_gcp_creds()
     if not creds: return None
     
     try:
         service = build('drive', 'v3', credentials=creds)
         
-        # 1. Create Session Sub-folder
-        # We explicitly set the parent to DRIVE_FOLDER_ID
+        # 1. Create Sub-folder (Shared Drive Compatible)
         subfolder_name = f"{date_str} - {folder_name}"
+        status_container.write(f"📂 Creating Drive Folder: `{subfolder_name}`...")
+        
         file_metadata = {
             'name': subfolder_name,
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [DRIVE_FOLDER_ID] 
         }
         
-        # Execute and explicitly request webViewLink
-        folder = service.files().create(body=file_metadata, fields='id, webViewLink').execute()
+        folder = service.files().create(
+            body=file_metadata, 
+            fields='id, webViewLink',
+            supportsAllDrives=True
+        ).execute()
+        
         folder_id = folder.get('id')
         folder_link = folder.get('webViewLink')
         
-        print(f"✅ Folder Created: {subfolder_name} (ID: {folder_id})")
-
-        # 2. Upload Files into that new subfolder
-        for f in file_objs:
-            f.seek(0) # Reset file pointer
+        # 2. Upload Files
+        total_files = len(file_objs)
+        for i, f in enumerate(file_objs):
+            status_container.write(f"⬆️ Uploading ({i+1}/{total_files}): **{f.name}**...")
+            
+            if progress_bar:
+                progress_val = int(((i + 1) / total_files) * 100)
+                progress_bar.progress(progress_val)
+            
+            # Buffer the file safely
+            f.seek(0)
+            file_data = f.read()
+            buffer = io.BytesIO(file_data)
+            
             mimetype = f.type if hasattr(f, 'type') else 'text/plain'
             filename = f.name if hasattr(f, 'name') else 'unknown_file'
             
-            media = MediaIoBaseUpload(f, mimetype=mimetype, resumable=True)
+            media = MediaIoBaseUpload(buffer, mimetype=mimetype, resumable=True)
             file_meta = {'name': filename, 'parents': [folder_id]}
             
-            service.files().create(body=file_meta, media_body=media, fields='id').execute()
-            print(f"✅ File Uploaded: {filename}")
+            service.files().create(
+                body=file_meta, 
+                media_body=media, 
+                fields='id',
+                supportsAllDrives=True
+            ).execute()
         
         return folder_link
         
+    except HttpError as e:
+        if "storageQuotaExceeded" in str(e):
+            st.warning("⚠️ **Storage Quota Exceeded**: File upload skipped, but Data saved to Sheet.")
+            return "SKIPPED_QUOTA"
+        elif "notFound" in str(e):
+            st.error(f"❌ **Folder Not Found (404)**. Check Shared Drive permissions.")
+            return None
+        else:
+            st.error(f"❌ Drive Error: {e}")
+            return None
     except Exception as e:
-        st.error(f"❌ Drive Upload Error: {e}")
-        print(f"❌ Drive Error: {e}")
+        st.error(f"❌ General Error: {e}")
         return None
 
 def get_history_df():
@@ -224,6 +264,7 @@ def parse_attendee_smart(uploaded_file):
 
 def parse_poll_dynamic(uploaded_file):
     try:
+        uploaded_file.seek(0)
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
@@ -239,21 +280,35 @@ def parse_poll_dynamic(uploaded_file):
 def analyze_dynamic_columns(df):
     metrics = {"ratings": {}, "nps": {}, "responses": len(df), "json_dist": "{}"}
     dist_storage = {}
+    
+    # Time Range Detection
+    time_col = next((c for c in df.columns if "Submitted Date" in c), None)
+    time_range_str = ""
+    if time_col:
+        try:
+            df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
+            min_t = df[time_col].min().strftime("%H:%M")
+            max_t = df[time_col].max().strftime("%H:%M")
+            time_range_str = f"Captured: {min_t} - {max_t}"
+        except: pass
+
     for col in df.columns:
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
         num = pd.to_numeric(df[col], errors='coerce')
-        if num.notna().sum() > (len(df)*0.1): # Valid numeric
+        if num.notna().sum() > (len(df)*0.1): 
             avg = num.mean()
             # 1-5 Scale
             if 0 <= avg <= 5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
                 clean_dist = pd.DataFrame({"Rating": counts.index.astype(str), "Count": counts.values})
-                metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist}
+                metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist, "time_str": time_range_str}
+                
                 if "overall" in clean: key_type = "Overall"
                 elif "trainer" in clean: key_type = "Trainer"
                 else: key_type = col 
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
+            
             # NPS
             if "recommend" in clean or "friend" in clean:
                 if num.max() > 5:
@@ -275,119 +330,143 @@ def analyze_dynamic_columns(df):
 tab_upload, tab_list, tab_analytics = st.tabs(["📤 Ops Command Center", "🔍 Session Registry", "📊 Executive Dashboard"])
 
 # ==========================================
-# TAB 1: OPS COMMAND CENTER (UPLOAD)
+# TAB 1: OPS COMMAND CENTER
 # ==========================================
 with tab_upload:
-    if "upload_key" not in st.session_state: st.session_state.upload_key = 0
+    status_area = st.empty()
+
     with st.sidebar:
-        st.header("1. Upload Session Data")
+        st.header("1. Ops Details")
+        uploader_name = st.text_input("Enter Your Name *", placeholder="e.g. Aryan")
+        
+        st.divider()
+        st.header("2. Session Data")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
-        st.markdown("---")
-        st.header("2. Assets & Links")
+        
+        st.divider()
+        st.header("3. Assets & Links")
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
+        if asset_files:
+            st.caption(f"✅ {len(asset_files)} file(s) attached")
+            
         session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
         
-        st.markdown("---")
-        st.header("3. Verify & Save")
-        stats = {"trainer": "Unknown", "duration": 0, "peak": 0, "unique": 0, "date": date.today(), "title": "Session", "end_count": 0, "stickiness": 0, "is_simulive": False, "timeline": None, "curve_str": ""}
-        if attendee_file:
-            stats = parse_attendee_smart(attendee_file)
-            if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
-            elif stats["trainer"] != "Unknown": st.success(f"✅ Found: {stats['trainer']}")
-        session_date = st.date_input("Date", value=stats["date"])
-        trainer_val = "Simulive Host" if stats["is_simulive"] else stats["trainer"]
-        trainer = st.text_input("Trainer", value=trainer_val)
-        batch = st.text_input("Batch", placeholder="e.g. AI CAP B5")
-        title = st.text_input("Title", value=stats["title"])
-        session_type = st.radio("Type", ["Live", "Simulive"], index=1 if stats["is_simulive"] else 0, horizontal=True)
-        c1, c2 = st.columns(2)
-        duration = c1.number_input("Dur (m)", value=stats["duration"])
-        peak = c2.number_input("Peak", value=stats["peak"])
-        unique = st.number_input("Unique", value=stats["unique"])
-        st.markdown("---")
-        save_btn = st.button("💾 Save All Data", type="primary", use_container_width=True)
+        st.divider()
+        btn_disabled = not (uploader_name and attendee_file)
+        save_btn = st.button("💾 Save All Data", type="primary", use_container_width=True, disabled=btn_disabled)
+        if btn_disabled:
+            st.caption("⚠️ Enter Name & Upload Attendee CSV to enable Save.")
 
     if poll_files and attendee_file:
-        st.markdown(f"## 🗓️ {session_date} | 👤 {trainer} | {'🟣' if session_type=='Simulive' else '🔴'} {session_type}")
-        st.markdown(f"**{title}**")
-        st.divider()
-
+        stats = parse_attendee_smart(attendee_file)
+        if stats["is_simulive"]: st.info("🟣 Detected **Simulive**")
+        
+        st.subheader("📝 Verify Details")
+        c1, c2 = st.columns(2)
+        with c1:
+            session_date = st.date_input("Date", value=stats["date"])
+            trainer = st.text_input("Trainer", value="Simulive Host" if stats["is_simulive"] else stats["trainer"])
+        with c2:
+            title = st.text_input("Title", value=stats["title"])
+            batch = st.text_input("Batch", placeholder="e.g. AI CAP B5")
+        
+        session_type = st.radio("Type", ["Live", "Simulive"], index=1 if stats["is_simulive"] else 0, horizontal=True)
+        
+        # EDITABLE METRICS
+        st.subheader("🛠️ Adjust Metrics (If needed)")
+        mc1, mc2, mc3 = st.columns(3)
+        duration_val = mc1.number_input("Duration (mins)", value=stats["duration"])
+        peak_val = mc2.number_input("Peak Attendees", value=stats["peak"])
+        unique_val = mc3.number_input("Unique Users", value=stats["unique"])
+        
+        # PROCESS POLLS
         all_polls = []
         for p in poll_files:
             p_df = parse_poll_dynamic(p)
             if p_df is not None:
                 all_polls.append(p_df)
         
+        # Aggregated stats
+        final_ov_val = 0
+        final_tr_val = 0
+        final_nps_val = "N/A"
+        final_json_dist = "{}"
+        total_responses = 0
+        
+        if analyzed_polls := []:
+            pass
+        # Correctly process polls for display and saving
+        analyzed_polls = []
         if all_polls:
-            df_poll = pd.concat(all_polls, ignore_index=True)
-            data = analyze_dynamic_columns(df_poll)
-            ov_key = next((k for k in data["ratings"] if "overall" in k.lower()), None)
-            tr_key = next((k for k in data["ratings"] if "trainer" in k.lower()), None)
-            ov_val = data["ratings"][ov_key]["avg"] if ov_key else 0
-            tr_val = data["ratings"][tr_key]["avg"] if tr_key else 0
-            nps_val = list(data["nps"].values())[0] if data["nps"] else "N/A"
-            trainer_score, ret_rate = 0.0, 0.0
-            if peak > 0 and tr_val > 0:
-                ret_rate = (stats["end_count"] / peak)
-                trainer_score = ret_rate * tr_val
-
-            sc1, sc2 = st.columns(2)
-            sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{trainer_score:.2f}</div><div class="score-sub">Retained {int(ret_rate*100)}% × Rating {tr_val}</div></div>""", unsafe_allow_html=True)
-            sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stats["stickiness"]*100)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+            df_merged = pd.concat(all_polls, ignore_index=True)
+            # Analyze each poll file separately for the "Preview" charts
+            for p_df in all_polls:
+                analyzed_polls.append(analyze_dynamic_columns(p_df))
             
-            with st.expander("ℹ️ How are these scores calculated?"):
-                st.markdown(r"""
-                **1. Stickiness Ratio (Magnetism)**
-                * **Formula:** $\frac{\text{End Count (Last 10\%)}}{\text{Peak Count}} \times 100$
-                * **What it means:** Of the people who showed up at the peak, how many stayed until the very end?
-
-                **2. Retention Score (Quality)**
-                * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
-                * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
-                """)
-            st.write("")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Duration", mins_to_hhmm(duration))
-            m2.metric("Unique Users", unique)
-            m3.metric("Overall Rating", ov_val)
-            m4.metric("Trainer Rating", tr_val)
-            m5.metric("NPS", nps_val)
-            st.divider()
+            # Analyze the merged data for the "Official" Sheet stats
+            merged_analysis = analyze_dynamic_columns(df_merged)
             
-            if stats["timeline"] is not None and not stats["timeline"].empty:
-                st.subheader("📉 Retention Curve")
-                fig = px.area(stats["timeline"], x="Time", y="Attendees", template="plotly_white")
-                fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)", line_shape="spline")
-                st.plotly_chart(fig, use_container_width=True)
+            ov_key = next((k for k in merged_analysis["ratings"] if "overall" in k.lower()), None)
+            tr_key = next((k for k in merged_analysis["ratings"] if "trainer" in k.lower()), None)
             
-            if data["ratings"]:
-                st.divider()
-                st.subheader("📈 Ratings Breakdown")
-                items = list(data["ratings"].items())
-                rows = (len(items) + 2) // 3
-                for row_idx in range(rows):
-                    cols = st.columns(3)
-                    for col_idx in range(3):
-                        idx = row_idx * 3 + col_idx
-                        if idx < len(items):
-                            q, m = items[idx]
-                            with cols[col_idx]:
-                                with st.container():
-                                    st.caption(f"{q[:45]}...")
-                                    fig_bar = px.bar(m["dist"], x="Rating", y="Count", text="Count", template="plotly_white")
-                                    fig_bar.update_layout(height=180, margin=dict(l=0, r=0, t=0, b=0), xaxis_title=None, yaxis_title=None)
-                                    fig_bar.update_traces(marker_color="#4a90e2", textposition='auto')
-                                    st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
+            final_ov_val = merged_analysis["ratings"][ov_key]["avg"] if ov_key else 0
+            final_tr_val = merged_analysis["ratings"][tr_key]["avg"] if tr_key else 0
+            final_nps_val = list(merged_analysis["nps"].values())[0] if merged_analysis["nps"] else "N/A"
+            final_json_dist = merged_analysis["json_dist"]
+            total_responses = merged_analysis["responses"]
 
-            if save_btn:
+        stickiness = (stats["end_count"] / peak_val) if peak_val > 0 else 0
+        trainer_score = (stickiness * final_tr_val) if final_tr_val > 0 else 0
+
+        st.divider()
+        sc1, sc2 = st.columns(2)
+        sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{trainer_score:.2f}</div><div class="score-sub">Retained {int(stickiness*100)}% × Rating {final_tr_val}</div></div>""", unsafe_allow_html=True)
+        sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness*100)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+        
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Duration", mins_to_hhmm(duration_val))
+        m2.metric("Unique Users", unique_val)
+        m3.metric("Overall Rating", final_ov_val)
+        m4.metric("Trainer Rating", final_tr_val)
+        m5.metric("NPS", final_nps_val)
+        
+        if stats["timeline"] is not None and not stats["timeline"].empty:
+            st.subheader("📉 Retention Curve Preview")
+            fig = px.area(stats["timeline"], x="Time", y="Attendees", template="plotly_white")
+            fig.update_traces(line_color="#9b59b6", fillcolor="rgba(155, 89, 182, 0.2)", line_shape="spline") # Purple
+            st.plotly_chart(fig, use_container_width=True)
+        
+        if analyzed_polls:
+            st.subheader("📈 Poll Charts Preview")
+            for idx, p_data in enumerate(analyzed_polls):
+                if p_data["ratings"]:
+                    st.caption(f"**Poll File {idx+1}**")
+                    cols = st.columns(len(p_data["ratings"]))
+                    for i, (q, m) in enumerate(p_data["ratings"].items()):
+                        with cols[i]:
+                            t_str = m.get("time_str", "")
+                            st.caption(f"{q} \n *{t_str}*")
+                            fig_bar = px.bar(m["dist"], x="Rating", y="Count", text="Count", template="plotly_white")
+                            fig_bar.update_layout(height=200, margin=dict(l=0, r=0, t=0, b=0))
+                            fig_bar.update_traces(marker_color="#3498db") # Blue
+                            st.plotly_chart(fig_bar, use_container_width=True)
+                    st.divider()
+
+        if save_btn:
+            with status_area.container():
+                status = st.status("🚀 Starting Upload Process...", expanded=True)
+                p_bar = status.progress(0)
+                
                 ws = connect_gsheet()
                 if ws:
                     try:
+                        status.write("📊 Saving Stats to Google Sheet...")
                         date_str = session_date.strftime("%Y-%m-%d")
-                        row = [date_str, trainer, title, batch, duration, peak, unique, int(stats["end_count"]), f"{trainer_score:.2f}", ov_val, tr_val, data["responses"], nps_val, session_type, stats["curve_str"], data["json_dist"]]
+                        row = [date_str, trainer, title, batch, duration_val, peak_val, unique_val, int(stats["end_count"]), f"{trainer_score:.2f}", final_ov_val, final_tr_val, total_responses, final_nps_val, session_type, stats["curve_str"], final_json_dist, uploader_name]
                         ws.append_row(row, value_input_option="USER_ENTERED")
-                        st.toast("✅ Stats Saved to Sheet!", icon="📊")
+                        status.write("✅ Sheet Updated!")
+                        p_bar.progress(30)
                         
                         all_files_to_upload = [attendee_file] + poll_files + (asset_files if asset_files else [])
                         if session_links.strip():
@@ -396,19 +475,25 @@ with tab_upload:
                             link_file.type = "text/plain"
                             all_files_to_upload.append(link_file)
                         
-                        folder_link = upload_to_drive(all_files_to_upload, title, date_str)
-                        if folder_link:
-                            st.success(f"✅ Files Uploaded! [**Click here to Open Drive Folder**]({folder_link})")
-                            st.info("ℹ️ Upload complete. Click 'Clear & New' below when ready.")
+                        folder_link = upload_to_drive_robust(all_files_to_upload, title, date_str, status, p_bar)
+                        
+                        if folder_link and folder_link != "SKIPPED_QUOTA":
+                            status.update(label="✅ Success! Session Saved.", state="complete", expanded=True)
+                            st.success(f"**Files Uploaded!** 👉 [**Open Google Drive Folder**]({folder_link})")
+                            st.button("🔄 Start New Upload", on_click=reset_app, type="primary")
+                        elif folder_link == "SKIPPED_QUOTA":
+                            status.update(label="⚠️ Saved (Drive Skipped)", state="complete", expanded=False)
+                            st.button("🔄 Start New Upload", on_click=reset_app)
                         else:
-                            st.warning("⚠️ Stats saved, but Drive upload failed/skipped.")
-                        
-                        if st.button("🔄 Clear & Start New Upload"):
-                            st.session_state.upload_key += 1
-                            st.rerun()
-                        
-                    except Exception as e: st.error(f"Error: {e}")
-    else: st.info("👋 Go to Sidebar to Upload.")
+                            status.update(label="⚠️ Drive Error", state="error")
+                            st.warning("Stats saved, but Drive upload failed.")
+                            st.button("🔄 Start New Upload", on_click=reset_app)
+                            
+                    except Exception as e:
+                        status.update(label="❌ Error", state="error")
+                        st.error(f"Error: {e}")
+    else:
+        st.info("👈 Please select files in the sidebar to begin.")
 
 # ==========================================
 # TAB 2: INTERACTIVE HISTORY
@@ -440,11 +525,8 @@ with tab_list:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
             df_disp = df.sort_values(by=date_col, ascending=False).copy()
             
-            table_cols = [date_col, trainer_col, title_col, batch_col, rating_col, type_col]
-            table_cols = [c for c in table_cols if c]
-            
-            selection = st.dataframe(
-                df_disp[table_cols],
+            event = st.dataframe(
+                df_disp,
                 use_container_width=True,
                 hide_index=True,
                 selection_mode="single-row",
@@ -456,22 +538,20 @@ with tab_list:
                 }
             )
             
-            if selection.selection.rows:
-                sel_idx = selection.selection.rows[0]
-                row = df_disp.iloc[sel_idx]
+            if event.selection.rows:
+                idx = event.selection.rows[0]
+                row = df_disp.iloc[idx]
                 
                 st.divider()
                 st.markdown(f"## 📄 {row[title_col]}")
                 st.caption(f"📅 {row[date_col].date()} | 👤 {row[trainer_col]} | 🎓 {row[batch_col]}")
                 
-                def safe_get(row, c, default=0):
-                    return row[c] if c and c in row and pd.notnull(row[c]) else default
-
-                peak = safe_get(row, peak_col)
-                end = safe_get(row, end_col)
-                ov_rate = safe_get(row, rating_col)
-                tr_rate = safe_get(row, tr_rating_col)
-                duration = safe_get(row, dur_col)
+                # Fetch row data safely
+                peak = row[peak_col] if peak_col else 0
+                end = row[end_col] if end_col else 0
+                ov_rate = row[rating_col] if rating_col else 0
+                tr_rate = row[tr_rating_col] if tr_rating_col else 0
+                duration = row[dur_col] if dur_col else 0
                 
                 stickiness = (end / peak * 100) if peak > 0 else 0
                 ret_score = (end/peak * ov_rate) if peak > 0 else 0
@@ -480,18 +560,6 @@ with tab_list:
                 sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{ret_score:.2f}</div></div>""", unsafe_allow_html=True)
                 sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
                 
-                with st.expander("ℹ️ How are these scores calculated?"):
-                    st.markdown(r"""
-                    **1. Stickiness Ratio (Magnetism)**
-                    * **Formula:** $\frac{\text{End Count}}{\text{Peak Count}} \times 100$
-                    * **What it means:** Of the people who showed up at the peak, how many stayed until the end?
-
-                    **2. Retention Score (Quality)**
-                    * **Formula:** $\text{Stickiness \%} \times \text{Trainer Rating}$
-                    * **What it means:** Adjusts the rating based on how many people actually stayed to give it.
-                    """)
-                st.write("")
-
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Overall Rating", f"{ov_rate:.2f}" if ov_rate else "-")
                 m2.metric("Trainer Rating", f"{tr_rate:.2f}" if tr_rate else "-")
@@ -500,60 +568,54 @@ with tab_list:
                 m5.metric("End Count", end)
                 
                 st.divider()
+                
                 st.subheader("📉 Retention Curve")
-                
-                curve_data = None
-                if curve_col: curve_data = str(row[curve_col])
-                elif len(row) > 14: curve_data = str(row.iloc[14])
-                
+                curve_data = str(row[curve_col]) if curve_col else ""
                 if curve_data and "|" in curve_data:
                     try:
                         counts = [float(x) for x in curve_data.split("|")]
                         x_axis = [i * (duration/len(counts)) for i in range(len(counts))]
                         chart_df = pd.DataFrame({"Time (min)": x_axis, "Attendees": counts})
                         fig = px.area(chart_df, x="Time (min)", y="Attendees", template="plotly_white")
-                        fig.update_traces(line_color="#764ba2", fillcolor="rgba(118, 75, 162, 0.2)", line_shape="spline")
+                        fig.update_traces(line_color="#9b59b6", fillcolor="rgba(155, 89, 182, 0.2)", line_shape="spline") # Purple Area
                         st.plotly_chart(fig, use_container_width=True)
-                    except: st.caption("⚠️ Error parsing retention data.")
-                elif peak > 0:
-                    st.caption("ℹ️ Using Linear Approximation (Historical Data)")
-                    sim_data = pd.DataFrame({"Progress": ["Start", "End"], "Attendees": [peak, end]})
-                    fig = px.area(sim_data, x="Progress", y="Attendees", template="plotly_white")
-                    fig.update_traces(line_color="#95a5a6", fillcolor="rgba(149, 165, 166, 0.2)")
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                st.subheader("📊 Rating Distributions")
-                dist_json = None
-                if dist_col: dist_json = str(row[dist_col])
-                elif len(row) > 15: dist_json = str(row.iloc[15])
-                
+                    except: st.caption("⚠️ Error parsing curve data.")
+                else: st.info("No retention data available.")
+
+                st.subheader("📊 Rating Breakdown")
+                dist_json = str(row[dist_col]) if dist_col else ""
                 if dist_json and "{" in dist_json:
                     try:
                         d_data = json.loads(dist_json)
-                        cols = st.columns(3)
-                        i = 0
-                        for category, values in d_data.items():
-                            if i < 3:
-                                with cols[i]:
-                                    st.caption(f"{category}")
-                                    # Plotly replacement
-                                    df_d = pd.DataFrame(list(values.items()), columns=['Rating', 'Count'])
-                                    df_d['Rating'] = df_d['Rating'].astype(str)
-                                    df_d['Count'] = df_d['Count'].astype(int)
-                                    fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", template="plotly_white")
-                                    fig_bar.update_layout(height=180, margin=dict(l=0, r=0, t=0, b=0), xaxis_title=None, yaxis_title=None)
-                                    fig_bar.update_traces(marker_color="#4a90e2", textposition='auto')
-                                    st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
-                                i += 1
-                    except: st.caption("No detail data.")
-                else: st.caption("ℹ️ Detailed rating counts not saved.")
+                        rc1, rc2, rc3 = st.columns(3)
+                        with rc1:
+                            if "Overall" in d_data:
+                                vals = d_data["Overall"]
+                                df_d = pd.DataFrame(list(vals.items()), columns=['Rating', 'Count'])
+                                fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="Overall", template="plotly_white")
+                                fig_bar.update_traces(marker_color="#3498db") # Blue
+                                st.plotly_chart(fig_bar, use_container_width=True)
+                        with rc2:
+                            if "Trainer" in d_data:
+                                vals = d_data["Trainer"]
+                                df_d = pd.DataFrame(list(vals.items()), columns=['Rating', 'Count'])
+                                fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="Trainer", template="plotly_white")
+                                fig_bar.update_traces(marker_color="#2ecc71") # Green
+                                st.plotly_chart(fig_bar, use_container_width=True)
+                        with rc3:
+                            if "NPS" in d_data:
+                                vals = d_data["NPS"]
+                                df_d = pd.DataFrame(list(vals.items()), columns=['Category', 'Count'])
+                                fig_pie = px.pie(df_d, values='Count', names='Category', title="NPS", template="plotly_white", hole=0.4)
+                                st.plotly_chart(fig_pie, use_container_width=True)
+                    except: st.caption("Error parsing details.")
 
 # ==========================================
 # TAB 3: EXECUTIVE DASHBOARD
 # ==========================================
 with tab_analytics:
     st.header("📊 Executive Dashboard")
-    if st.button("🔄 Refresh Data", key="refresh_exec", type="primary"): st.session_state.pop('exec_df', None)
+    if st.button("🔄 Refresh Analysis"): st.session_state.pop('exec_df', None)
     
     if 'exec_df' not in st.session_state or st.session_state.exec_df.empty:
         st.session_state.exec_df = get_history_df()
@@ -566,8 +628,8 @@ with tab_analytics:
         rating_col = next((c for c in df.columns if "Overall" in c), None)
         nps_col = next((c for c in df.columns if "NPS" in c), None)
         type_col = next((c for c in df.columns if "Type" in c), None)
-        batch_col = next((c for c in df.columns if "Batch" in c), None)
         dur_col = next((c for c in df.columns if "Duration" in c), None)
+        title_col = next((c for c in df.columns if "Title" in c), None)
         
         if date_col:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
@@ -590,65 +652,58 @@ with tab_analytics:
                                      color_continuous_scale="RdYlGn", size_max=60, template="plotly_white")
                 fig_bub.add_hline(y=4.5, line_dash="dot")
                 st.plotly_chart(fig_bub, use_container_width=True)
-                st.caption("ℹ️ **Star %**: Percentage of sessions where the trainer achieved an Overall Rating > 4.6")
             st.divider()
 
-            # 2. LIVE vs SIMULIVE & NPS
-            st.markdown("### 📊 Overall Performance")
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                if type_col and rating_col:
-                    st.markdown("**🔴 Live vs. 🟣 Simulive**")
-                    df['Type_Norm'] = df[type_col].astype(str).str.lower()
-                    live_avg = df[df['Type_Norm'] == 'live'][rating_col].mean()
-                    sim_avg = df[df['Type_Norm'] == 'simulive'][rating_col].mean()
-                    
-                    sub_c1, sub_c2, sub_c3 = st.columns(3)
-                    sub_c1.metric("Live Avg", f"{live_avg:.2f}" if pd.notna(live_avg) else "-")
-                    sub_c2.metric("Simulive Avg", f"{sim_avg:.2f}" if pd.notna(sim_avg) else "-")
-                    sub_c3.metric("Gap", f"{(live_avg - sim_avg):.2f}" if pd.notna(live_avg) and pd.notna(sim_avg) else "-")
-                    
-                    fig = px.box(df, x=type_col, y=rating_col, color=type_col, points="all", template="plotly_white")
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            with c2:
-                if nps_col:
-                    st.markdown("**❤️ NPS Trend**")
-                    df[nps_col] = pd.to_numeric(df[nps_col], errors='coerce')
-                    avg_nps = df[nps_col].mean()
-                    st.metric("Avg NPS", f"{int(avg_nps)}" if pd.notna(avg_nps) else "-")
-                    fig_nps = px.line(df, x=date_col, y=nps_col, markers=True, template="plotly_white")
-                    fig_nps.update_traces(line_color="#e74c3c")
-                    st.plotly_chart(fig_nps, use_container_width=True)
-            st.divider()
-
-            # 3. WEEKLY IMPACT HEATMAP (Updated)
-            if date_col and type_col and rating_col:
-                st.markdown("### 📅 Weekly Impact Heatmap")
+            # 2. WEEKLY PERFORMANCE (Day-Wise Bar Chart)
+            if type_col and rating_col:
+                st.markdown("### 📅 Weekly Performance (Live vs Simulive)")
                 df['Day'] = df[date_col].dt.day_name()
                 days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 df['Day'] = pd.Categorical(df['Day'], categories=days_order, ordered=True)
                 
-                pivot_mean = df.pivot_table(index='Day', columns=type_col, values=rating_col, aggfunc='mean')
-                pivot_count = df.pivot_table(index='Day', columns=type_col, values=rating_col, aggfunc='count')
+                day_stats = df.groupby(['Day', type_col], observed=True)[rating_col].agg(
+                    Average=('mean'),
+                    Sessions=('count')
+                ).reset_index()
                 
-                fig_h = px.imshow(
-                    pivot_mean, 
-                    text_auto=".2f", 
-                    aspect="auto", 
-                    color_continuous_scale="RdYlGn", 
-                    origin='lower'
-                )
-                fig_h.update_traces(
-                    customdata=pivot_count,
-                    hovertemplate="<b>%{x}</b><br>Day: %{y}<br>Rating: %{z:.2f}<br>Sessions: %{customdata} <extra></extra>"
-                )
-                st.plotly_chart(fig_h, use_container_width=True)
+                fig_day = px.bar(day_stats, x="Day", y="Average", color=type_col, barmode="group", 
+                                 text_auto=".2f",
+                                 hover_data=["Sessions"],
+                                 color_discrete_map={"Live": "#00C9A7", "Simulive": "#845EC2"}, # Teal & Purple
+                                 template="plotly_white")
+                fig_day.update_traces(marker_line_width=0)
+                st.plotly_chart(fig_day, use_container_width=True)
+            
+            st.divider()
+
+            # 3. LIVE vs SIMULIVE & NPS
+            st.markdown("### 📊 Distribution & Trends")
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                if type_col and rating_col:
+                    st.markdown("**🔴 Live vs. 🟣 Simulive Distribution**")
+                    fig = px.box(df, x=type_col, y=rating_col, color=type_col, points="all", 
+                                 color_discrete_map={"Live": "#00C9A7", "Simulive": "#845EC2"},
+                                 template="plotly_white")
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with c2:
+                if nps_col:
+                    st.markdown("**❤️ Daily NPS Trend**")
+                    df[nps_col] = pd.to_numeric(df[nps_col], errors='coerce')
+                    nps_daily = df.groupby(date_col)[nps_col].mean().reset_index()
+                    fig_nps = px.line(nps_daily, x=date_col, y=nps_col, markers=True, template="plotly_white")
+                    fig_nps.update_traces(line_color="#e74c3c", line_width=3) # Red
+                    st.plotly_chart(fig_nps, use_container_width=True)
             st.divider()
 
             # 4. DURATION IMPACT
             if dur_col and rating_col:
                 st.markdown("### ⏱️ Duration vs. Rating Impact")
+                hover_cols = [title_col] if title_col else []
                 fig_s = px.scatter(df, x=dur_col, y=rating_col, color=type_col if type_col else None, 
-                                   template="plotly_white", opacity=0.7)
+                                   hover_data=hover_cols,
+                                   color_discrete_map={"Live": "#00C9A7", "Simulive": "#845EC2"},
+                                   template="plotly_white", opacity=0.8)
+                fig_s.update_traces(marker=dict(size=12, line=dict(width=1, color='DarkSlateGrey')))
                 st.plotly_chart(fig_s, use_container_width=True)
