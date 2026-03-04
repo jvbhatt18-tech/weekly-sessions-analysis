@@ -45,6 +45,7 @@ def connect_gsheet():
         return None
 
 def get_history_df():
+    # No cache for instant updates
     ws = connect_gsheet()
     if not ws: return pd.DataFrame()
     data = ws.get_all_records()
@@ -175,15 +176,12 @@ def parse_attendee_smart(uploaded_file):
 def parse_poll_dynamic(uploaded_file):
     try:
         lines = uploaded_file.getvalue().decode("utf-8", errors='replace').splitlines()
-        # Find header by looking for common columns
         h_idx = next((i for i, l in enumerate(lines) if "User Name" in l and "Email" in l), -1)
         if h_idx == -1: return None
-        
         data = [lines[h_idx]]
         for l in lines[h_idx+1:]:
             if "Feedback Poll" in l: break
             data.append(l)
-            
         df = pd.read_csv(io.StringIO("\n".join(data)), index_col=False)
         df.columns = [c.strip() for c in df.columns]
         return df
@@ -192,23 +190,17 @@ def parse_poll_dynamic(uploaded_file):
 def analyze_dynamic_columns(df):
     metrics = {"ratings": {}, "nps": {}, "responses": len(df), "json_dist": "{}"}
     dist_storage = {}
-    
     for col in df.columns:
         clean = col.lower()
         if any(x in clean for x in ['user', 'email', 'date', 'time', '#']): continue
         
-        # Force numeric conversion for questions
         num = pd.to_numeric(df[col], errors='coerce')
-        
         if num.notna().sum() > (len(df)*0.1): # Valid numeric column
             avg = num.mean()
             
             # 1-5 Scale Question
             if 0 <= avg <= 5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
-                
-                # CRITICAL FIX: Create clean dataframe for plotting
-                # We rename columns to avoid special characters in charts
                 clean_dist = pd.DataFrame({
                     "Rating": counts.index.astype(str), 
                     "Count": counts.values
@@ -218,7 +210,6 @@ def analyze_dynamic_columns(df):
                 if "overall" in clean: key_type = "Overall"
                 elif "trainer" in clean: key_type = "Trainer"
                 else: key_type = col 
-                
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
                 
             # NPS Question
@@ -239,7 +230,7 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics, tab_retention = st.tabs(["📤 Upload Session", "🔍 Recent Sessions", "📊 Dashboard", "📉 Retention Lab"])
+tab_upload, tab_list, tab_analytics = st.tabs(["📤 Upload Session", "🔍 History & Details", "📊 Executive Dashboard"])
 
 # ==========================================
 # TAB 1: UPLOAD
@@ -332,7 +323,6 @@ with tab_upload:
                             with cols[col_idx]:
                                 with st.container():
                                     st.caption(f"{q[:45]}...")
-                                    # Plotly Bar Chart (Crash-proof)
                                     fig_bar = px.bar(m["dist"], x="Rating", y="Count", text="Count", template="plotly_white")
                                     fig_bar.update_layout(height=180, margin=dict(l=0, r=0, t=0, b=0), xaxis_title=None, yaxis_title=None)
                                     fig_bar.update_traces(marker_color="#4a90e2", textposition='auto')
@@ -477,12 +467,9 @@ with tab_list:
                             if i < 3:
                                 with cols[i]:
                                     st.caption(f"{category}")
-                                    # Convert dict to DF for Plotly
                                     df_d = pd.DataFrame(list(values.items()), columns=['Rating', 'Count'])
                                     df_d['Rating'] = df_d['Rating'].astype(str)
                                     df_d['Count'] = df_d['Count'].astype(int)
-                                    
-                                    # PLOTLY REPLACEMENT
                                     fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", template="plotly_white")
                                     fig_bar.update_layout(height=180, margin=dict(l=0, r=0, t=0, b=0), xaxis_title=None, yaxis_title=None)
                                     fig_bar.update_traces(marker_color="#4a90e2", textposition='auto')
@@ -508,7 +495,7 @@ with tab_analytics:
         trainer_col = next((c for c in df.columns if "Trainer" in c), None)
         rating_col = next((c for c in df.columns if "Overall" in c), None)
         type_col = next((c for c in df.columns if "Type" in c), None)
-        batch_col = next((c for c in df.columns if "Batch" in c), None)
+        dur_col = next((c for c in df.columns if "Duration" in c), None)
         
         if date_col:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
@@ -517,14 +504,25 @@ with tab_analytics:
             sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="exec_d")
             if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
             
-            st.markdown("### 🎓 Batch Health Heatmap")
-            if batch_col and rating_col:
-                df['Month'] = df[date_col].dt.strftime('%Y-%m')
-                pivot = df.pivot_table(index=batch_col, columns='Month', values=rating_col, aggfunc='mean')
-                fig_h = px.imshow(pivot, text_auto=".1f", aspect="auto", color_continuous_scale="RdYlGn", origin='lower')
-                st.plotly_chart(fig_h, use_container_width=True)
+            # 1. TRAINER MATRIX (TOP)
+            if trainer_col and rating_col:
+                st.markdown("### 🏆 Trainer Matrix")
+                t_stats = df.groupby(trainer_col).agg(
+                    Count=(rating_col,'count'),
+                    Avg=(rating_col,'mean'),
+                    High=(rating_col, lambda x: (x>4.6).sum())
+                ).reset_index()
+                t_stats['Star %'] = (t_stats['High']/t_stats['Count']*100).round(1)
+                t_stats['Avg'] = t_stats['Avg'].round(2)
+                
+                fig_bub = px.scatter(t_stats, x="Count", y="Avg", size="Count", color="Star %", hover_name=trainer_col, 
+                                     color_continuous_scale="RdYlGn", size_max=60, template="plotly_white")
+                fig_bub.add_hline(y=4.5, line_dash="dot")
+                st.plotly_chart(fig_bub, use_container_width=True)
+                st.caption("ℹ️ **Star %**: Percentage of sessions where the trainer achieved an Overall Rating > 4.6")
             st.divider()
 
+            # 2. LIVE vs SIMULIVE
             if type_col and rating_col:
                 st.markdown("### 🔴 Live vs. 🟣 Simulive")
                 df['Type_Norm'] = df[type_col].astype(str).str.lower()
@@ -537,69 +535,23 @@ with tab_analytics:
                 fig = px.box(df, x=type_col, y=rating_col, color=type_col, points="all", template="plotly_white")
                 st.plotly_chart(fig, use_container_width=True)
             st.divider()
-            
-            if trainer_col and rating_col:
-                st.markdown("### 🏆 Trainer Matrix")
-                t_stats = df.groupby(trainer_col).agg(
-                    Count=(rating_col,'count'),
-                    Avg=(rating_col,'mean'),
-                    High=(rating_col, lambda x: (x>4.6).sum())
-                ).reset_index()
-                t_stats['Star %'] = (t_stats['High']/t_stats['Count']*100).round(1)
-                t_stats['Avg'] = t_stats['Avg'].round(2)
-                fig_bub = px.scatter(t_stats, x="Count", y="Avg", size="Count", color="Star %", hover_name=trainer_col, 
-                                     color_continuous_scale="RdYlGn", size_max=60, template="plotly_white")
-                fig_bub.add_hline(y=4.5, line_dash="dot")
-                st.plotly_chart(fig_bub, use_container_width=True)
 
-# ==========================================
-# TAB 4: RETENTION LAB
-# ==========================================
-with tab_retention:
-    st.header("📉 Retention Lab")
-    if st.button("🔄 Refresh Data", key="refresh_ret", type="primary"): st.session_state.pop('ret_df', None)
-    
-    if 'ret_df' not in st.session_state or st.session_state.ret_df.empty:
-        st.session_state.ret_df = get_history_df()
-        
-    df = st.session_state.ret_df.copy()
-    if not df.empty:
-        df.columns = [str(c).strip() for c in df.columns]
-        peak_col = next((c for c in df.columns if "Peak" in c), None)
-        end_col = next((c for c in df.columns if "End" in c), None)
-        date_col = next((c for c in df.columns if "Date" in c), None)
-        batch_col = next((c for c in df.columns if "Batch" in c), None)
-        
-        if peak_col and date_col:
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-            df[peak_col] = pd.to_numeric(df[peak_col], errors='coerce').fillna(0)
-            df[end_col] = pd.to_numeric(df[end_col], errors='coerce').fillna(0)
-            
-            min_d, max_d = df[date_col].min(), df[date_col].max()
-            sel = st.date_input("Filter Date Range", value=(min_d, max_d), key="ret_d")
-            if len(sel)==2: df = df[(df[date_col] >= pd.to_datetime(sel[0])) & (df[date_col] <= pd.to_datetime(sel[1]))]
-            
-            df = df[df[peak_col] > 0].sort_values(by=date_col)
-            
-            if not df.empty:
-                st.markdown("### 🏚️ Batch Decay")
-                if batch_col:
-                    sb = st.selectbox("Select Batch", df[batch_col].unique())
-                    b_df = df[df[batch_col] == sb].sort_values(by=date_col)
-                    if not b_df.empty:
-                        base = b_df.iloc[0][peak_col]
-                        b_df['Rel'] = (b_df[peak_col]/base*100) if base > 0 else 0
-                        b_df['Seq'] = range(1, len(b_df)+1)
-                        fig = px.line(b_df, x='Seq', y='Rel', markers=True, title=f"Decay: {sb}", template="plotly_white")
-                        fig.update_yaxes(range=[0, 110])
-                        st.plotly_chart(fig, use_container_width=True)
+            # 3. WEEKLY IMPACT HEATMAP (Day of Week vs Type)
+            if date_col and type_col and rating_col:
+                st.markdown("### 📅 Weekly Impact Heatmap")
+                df['Day'] = df[date_col].dt.day_name()
+                # Ensure correct day order
+                days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                df['Day'] = pd.Categorical(df['Day'], categories=days_order, ordered=True)
                 
-                st.divider()
-                if end_col:
-                    df['Stick'] = (df[end_col]/df[peak_col]*100)
-                    st.markdown("### 🧲 Stickiness Trend")
-                    fig_s = px.line(df, x=date_col, y="Stick", markers=True, title="Stickiness % (End/Peak)", template="plotly_white")
-                    fig_s.update_traces(line_color="#27ae60")
-                    st.plotly_chart(fig_s, use_container_width=True)
-            else:
-                st.warning("No valid retention data in range.")
+                pivot = df.pivot_table(index='Day', columns=type_col, values=rating_col, aggfunc='mean')
+                fig_h = px.imshow(pivot, text_auto=".2f", aspect="auto", color_continuous_scale="RdYlGn", origin='lower')
+                st.plotly_chart(fig_h, use_container_width=True)
+            st.divider()
+
+            # 4. DURATION IMPACT
+            if dur_col and rating_col:
+                st.markdown("### ⏱️ Duration vs. Rating Impact")
+                fig_s = px.scatter(df, x=dur_col, y=rating_col, color=type_col if type_col else None, 
+                                   trendline="ols", template="plotly_white", opacity=0.7)
+                st.plotly_chart(fig_s, use_container_width=True)
