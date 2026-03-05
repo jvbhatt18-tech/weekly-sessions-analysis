@@ -53,7 +53,7 @@ def mins_to_hhmm(minutes):
         return f"{m // 60}h {m % 60:02d}m"
     except: return "0h 00m"
 
-# ─── CONNECTIONS (Cached) ───
+# ─── CONNECTIONS (OPTIMIZED CACHING) ───
 @st.cache_resource
 def get_gcp_creds():
     if "gcp_service_account" not in st.secrets: 
@@ -62,7 +62,9 @@ def get_gcp_creds():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
 
+@st.cache_resource
 def connect_gsheet():
+    """Cached connection to Google Sheet to avoid re-auth lag"""
     creds = get_gcp_creds()
     if not creds: return None
     gc = gspread.authorize(creds)
@@ -71,6 +73,14 @@ def connect_gsheet():
         st.error(f"❌ Sheet Connection Error: {e}")
         return None
 
+@st.cache_data(ttl=300)  # Cache data for 5 minutes
+def get_history_df():
+    """Fetches data from Google Sheet with caching for speed"""
+    ws = connect_gsheet()
+    if not ws: return pd.DataFrame()
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
+
 def upload_to_drive_robust(file_objs, folder_name, date_str, status_container, progress_bar):
     creds = get_gcp_creds()
     if not creds: return None
@@ -78,7 +88,6 @@ def upload_to_drive_robust(file_objs, folder_name, date_str, status_container, p
     try:
         service = build('drive', 'v3', credentials=creds)
         
-        # 1. Create Sub-folder (Shared Drive Compatible)
         subfolder_name = f"{date_str} - {folder_name}"
         status_container.write(f"📂 Creating Drive Folder: `{subfolder_name}`...")
         
@@ -97,7 +106,6 @@ def upload_to_drive_robust(file_objs, folder_name, date_str, status_container, p
         folder_id = folder.get('id')
         folder_link = folder.get('webViewLink')
         
-        # 2. Upload Files
         total_files = len(file_objs)
         for i, f in enumerate(file_objs):
             status_container.write(f"⬆️ Uploading ({i+1}/{total_files}): **{f.name}**...")
@@ -138,12 +146,6 @@ def upload_to_drive_robust(file_objs, folder_name, date_str, status_container, p
     except Exception as e:
         st.error(f"❌ General Error: {e}")
         return None
-
-def get_history_df():
-    ws = connect_gsheet()
-    if not ws: return pd.DataFrame()
-    data = ws.get_all_records()
-    return pd.DataFrame(data)
 
 # ─── PARSERS ───
 def calculate_precise_duration(intervals):
@@ -285,7 +287,6 @@ def analyze_dynamic_columns(df):
     metrics = {"ratings": {}, "nps": {}, "responses": len(df), "json_dist": "{}"}
     dist_storage = {}
     
-    # Time Range Detection
     time_col = next((c for c in df.columns if "Submitted Date" in c), None)
     time_range_str = ""
     if time_col:
@@ -302,18 +303,15 @@ def analyze_dynamic_columns(df):
         num = pd.to_numeric(df[col], errors='coerce')
         if num.notna().sum() > (len(df)*0.1): 
             avg = num.mean()
-            # 1-5 Scale
             if 0 <= avg <= 5: 
                 counts = num.value_counts().reindex([5,4,3,2,1], fill_value=0)
                 clean_dist = pd.DataFrame({"Rating": counts.index.astype(str), "Count": counts.values})
                 metrics["ratings"][col] = {"avg": round(avg, 2), "dist": clean_dist, "time_str": time_range_str}
-                
                 if "overall" in clean: key_type = "Overall"
                 elif "trainer" in clean: key_type = "Trainer"
                 else: key_type = col 
                 dist_storage[key_type] = {str(k): int(v) for k, v in counts.items()}
             
-            # NPS
             if "recommend" in clean or "friend" in clean:
                 if num.max() > 5:
                     prom = (num >= 9).sum()
@@ -331,7 +329,7 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics = st.tabs(["📤 Upload Center", "🔍 Sessions History", "📊 Analysis"])
+tab_upload, tab_list, tab_analytics = st.tabs(["📤 Ops Command Center", "🔍 Session Registry", "📊 Executive Dashboard"])
 
 # ==========================================
 # TAB 1: OPS COMMAND CENTER
@@ -341,26 +339,26 @@ with tab_upload:
 
     with st.sidebar:
         st.header("1. Ops Details")
-        uploader_name = st.text_input("Enter Your Full Name *", placeholder="e.g. Yasin Kaif")
+        uploader_name = st.text_input("Enter Your Name *", placeholder="e.g. Aryan")
         
         st.divider()
-        st.header("2. Session Zoom Exports")
+        st.header("2. Session Data")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
         
         st.divider()
-        st.header("3. Additional Files/Resources")
+        st.header("3. Assets & Links")
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
         if asset_files:
             st.caption(f"✅ {len(asset_files)} file(s) attached")
             
-        session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links, text etc here...", height=100)
+        session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
         
         st.divider()
         btn_disabled = not (uploader_name and attendee_file)
         save_btn = st.button("💾 Save All Data", type="primary", use_container_width=True, disabled=btn_disabled)
         if btn_disabled:
-            st.caption("⚠️ Enter Name, & Upload Attendee and Poll CSVs to enable Save.")
+            st.caption("⚠️ Enter Name & Upload Attendee CSV to enable Save.")
 
     if poll_files and attendee_file:
         stats = parse_attendee_smart(attendee_file)
@@ -377,21 +375,18 @@ with tab_upload:
         
         session_type = st.radio("Type", ["Live", "Simulive"], index=1 if stats["is_simulive"] else 0, horizontal=True)
         
-        # EDITABLE METRICS
         st.subheader("🛠️ Adjust Metrics (If needed)")
         mc1, mc2, mc3 = st.columns(3)
         duration_val = mc1.number_input("Duration (mins)", value=stats["duration"])
         peak_val = mc2.number_input("Peak Attendees", value=stats["peak"])
         unique_val = mc3.number_input("Unique Users", value=stats["unique"])
         
-        # PROCESS POLLS
         all_polls = []
         for p in poll_files:
             p_df = parse_poll_dynamic(p)
             if p_df is not None:
                 all_polls.append(p_df)
         
-        # Aggregated stats
         final_ov_val = 0
         final_tr_val = 0
         final_nps_val = "N/A"
@@ -420,7 +415,7 @@ with tab_upload:
         st.divider()
         sc1, sc2 = st.columns(2)
         sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{trainer_score:.2f}</div><div class="score-sub">Retained {int(stickiness*100)}% × Rating {final_tr_val}</div></div>""", unsafe_allow_html=True)
-        sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness*100)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+        sc2.markdown(f"""<div class="score-card secondary"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness*100)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
         
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Duration", mins_to_hhmm(duration_val))
@@ -464,6 +459,10 @@ with tab_upload:
                         row = [date_str, trainer, title, batch, duration_val, peak_val, unique_val, int(stats["end_count"]), f"{trainer_score:.2f}", final_ov_val, final_tr_val, total_responses, final_nps_val, session_type, stats["curve_str"], final_json_dist, uploader_name]
                         ws.append_row(row, value_input_option="USER_ENTERED")
                         status.write("✅ Sheet Updated!")
+                        
+                        # FORCE CLEAR CACHE TO SHOW NEW DATA IMMEDIATELY
+                        get_history_df.clear()
+                        
                         p_bar.progress(30)
                         
                         all_files_to_upload = [attendee_file] + poll_files + (asset_files if asset_files else [])
@@ -497,13 +496,16 @@ with tab_upload:
 # TAB 2: INTERACTIVE HISTORY
 # ==========================================
 with tab_list:
-    st.header("🔍 Recent Sessions History")
-    if st.button("🔄 Refresh List", type="primary"): st.session_state.pop('hist_df', None)
+    st.header("🔍 Recent Sessions Registry")
     
-    if 'hist_df' not in st.session_state or st.session_state.hist_df.empty:
-        st.session_state.hist_df = get_history_df()
+    # Optimized Refresh Button (Clears Cache)
+    if st.button("🔄 Refresh List", type="primary"):
+        get_history_df.clear()
+        st.rerun()
     
-    df = st.session_state.hist_df.copy()
+    # LOAD CACHED DATA
+    df = get_history_df().copy()
+    
     if not df.empty:
         df.columns = [str(c).strip() for c in df.columns]
         date_col = next((c for c in df.columns if "Date" in c), None)
@@ -518,13 +520,23 @@ with tab_list:
         type_col = next((c for c in df.columns if "Type" in c), None)
         curve_col = next((c for c in df.columns if "Curve" in c), None)
         dist_col = next((c for c in df.columns if "Rating" in c and "Dist" in c or "json" in c), None)
+        nps_col = next((c for c in df.columns if "NPS" in c), None)
+        resp_col = next((c for c in df.columns if "Response" in c or "Count" in c), None)
         
         if date_col and title_col:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
             df_disp = df.sort_values(by=date_col, ascending=False).copy()
             
+            # Convert mins to hours for display
+            if dur_col:
+                df_disp["Duration (hrs)"] = (pd.to_numeric(df_disp[dur_col], errors='coerce') / 60).round(1)
+            
+            # Column Order
+            disp_cols = [date_col, trainer_col, title_col, batch_col, "Duration (hrs)", type_col, tr_rating_col, rating_col, nps_col, resp_col, peak_col]
+            disp_cols = [c for c in disp_cols if c] # Clean Nones
+            
             event = st.dataframe(
-                df_disp,
+                df_disp[disp_cols],
                 use_container_width=True,
                 hide_index=True,
                 selection_mode="single-row",
@@ -532,7 +544,6 @@ with tab_list:
                 column_config={
                     date_col: st.column_config.DateColumn("Date", format="DD MM YY"),
                     rating_col: st.column_config.ProgressColumn("Rating", format="%.2f", min_value=1, max_value=5),
-                    type_col: st.column_config.TextColumn("Type", width="small")
                 }
             )
             
@@ -555,7 +566,7 @@ with tab_list:
 
                 sc1, sc2 = st.columns(2)
                 sc1.markdown(f"""<div class="score-card"><div class="score-label">Retention Score</div><div class="score-val">{ret_score:.2f}</div></div>""", unsafe_allow_html=True)
-                sc2.markdown(f"""<div class="score-card" style="background: linear-gradient(135deg, #FF9966 0%, #FF5E62 100%);"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
+                sc2.markdown(f"""<div class="score-card secondary"><div class="score-label">Stickiness Ratio</div><div class="score-val">{int(stickiness)}%</div><div class="score-sub">End/Peak %</div></div>""", unsafe_allow_html=True)
                 
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Overall Rating", f"{ov_rate:.2f}" if ov_rate else "-")
@@ -623,12 +634,12 @@ with tab_list:
 # ==========================================
 with tab_analytics:
     st.header("📊 Analysis Dashboard")
-    if st.button("🔄 Refresh Analysis"): st.session_state.pop('exec_df', None)
+    # Optimized Refresh (Clears Cache)
+    if st.button("🔄 Refresh Analysis"):
+        get_history_df.clear()
+        st.rerun()
     
-    if 'exec_df' not in st.session_state or st.session_state.exec_df.empty:
-        st.session_state.exec_df = get_history_df()
-    
-    df = st.session_state.exec_df.copy()
+    df = get_history_df().copy()
     if not df.empty:
         df.columns = [str(c).strip() for c in df.columns]
         date_col = next((c for c in df.columns if "Date" in c), None)
@@ -649,7 +660,7 @@ with tab_analytics:
             
             # 1. TRAINER MATRIX
             if trainer_col and rating_col:
-                st.markdown("### 🏆 Trainer Performance")
+                st.markdown("### 🏆 Trainer Matrix")
                 with st.expander("ℹ️ How to read this chart"):
                     st.caption("""
                     * **X-Axis (Count):** Number of sessions conducted.
