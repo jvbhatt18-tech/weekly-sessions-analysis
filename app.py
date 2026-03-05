@@ -329,7 +329,7 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics = st.tabs(["📤 Ops Command Center", "🔍 Session Registry", "📊 Executive Dashboard"])
+tab_upload, tab_list, tab_analytics = st.tabs(["📤 Upload Center", "🔍 Sessions History", "📊 Analysis"])
 
 # ==========================================
 # TAB 1: OPS COMMAND CENTER
@@ -338,21 +338,21 @@ with tab_upload:
     status_area = st.empty()
 
     with st.sidebar:
-        st.header("1. Ops Details")
-        uploader_name = st.text_input("Enter Your Name *", placeholder="e.g. Aryan")
+        st.header("1. Who is uploading?")
+        uploader_name = st.text_input("Enter Your full Name *", placeholder="e.g. Yasin Kaif")
         
         st.divider()
-        st.header("2. Session Data")
+        st.header("2. Session's Zoom Attendee & Poll(s)")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
         
         st.divider()
-        st.header("3. Assets & Links")
+        st.header("3. Additional Resources if any")
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
         if asset_files:
             st.caption(f"✅ {len(asset_files)} file(s) attached")
             
-        session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
+        session_links = st.text_area("Any Links/text (Google Docs/sheet URL)", placeholder="Paste links/text here...", height=100)
         
         st.divider()
         btn_disabled = not (uploader_name and attendee_file)
@@ -623,7 +623,7 @@ with tab_list:
                                 else:
                                     vals = d_data[nps_key]
                                     df_d = pd.DataFrame(list(vals.items()), columns=['Rating', 'Count'])
-                                    fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="NPS Distribution", template="plotly_white")
+                                    fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="NPS", template="plotly_white")
                                     fig_bar.update_traces(marker_color="#e74c3c")
                                     st.plotly_chart(fig_bar, use_container_width=True)
                             else: st.info("No NPS data found.")
@@ -660,7 +660,7 @@ with tab_analytics:
             
             # 1. TRAINER MATRIX
             if trainer_col and rating_col:
-                st.markdown("### 🏆 Trainer Matrix")
+                st.markdown("### 🏆 Trainer Performance")
                 with st.expander("ℹ️ How to read this chart"):
                     st.caption("""
                     * **X-Axis (Count):** Number of sessions conducted.
@@ -683,7 +683,7 @@ with tab_analytics:
 
             # 2. CHRONOLOGICAL PERFORMANCE (Timeline)
             if rating_col and tr_rating_col:
-                st.markdown("### 📅 Chronological Performance Trend")
+                st.markdown("### 📅 Chronological Weekly Performance Trend")
                 chron_perf = df.groupby(date_col)[[rating_col, tr_rating_col]].mean().reset_index()
                 chron_melt = chron_perf.melt(id_vars=date_col, value_vars=[rating_col, tr_rating_col], var_name='Metric', value_name='Rating')
                 
@@ -696,7 +696,7 @@ with tab_analytics:
 
             # 3. WEEKLY PERFORMANCE (Day-Wise Bar Chart)
             if type_col and rating_col:
-                st.markdown("### 🗓️ Weekly Performance (Live vs Simulive)")
+                st.markdown("### 🗓️ Average ofSaturdays/Sundays Live vs Simulive)")
                 df['Day'] = df[date_col].dt.day_name()
                 days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 df['Day'] = pd.Categorical(df['Day'], categories=days_order, ordered=True)
@@ -717,7 +717,7 @@ with tab_analytics:
             st.divider()
 
             # 4. LIVE vs SIMULIVE & NPS
-            st.markdown("### 📊 Distribution & Trends")
+            st.markdown("### 📊 Ratings Distribution & Trends")
             with st.expander("ℹ️ Understanding Box Plots"):
                 st.caption("The box shows the middle 50% of ratings. The line inside is the median. Dots outside are outliers (unusually high or low ratings).")
                 
@@ -732,7 +732,7 @@ with tab_analytics:
             
             with c2:
                 if nps_col:
-                    st.markdown("**❤️ Daily NPS Trend**")
+                    st.markdown("**❤️ Weekly NPS Trend**")
                     df[nps_col] = pd.to_numeric(df[nps_col], errors='coerce')
                     nps_daily = df.groupby(date_col)[nps_col].mean().reset_index()
                     fig_nps = px.line(nps_daily, x=date_col, y=nps_col, markers=True, template="plotly_white")
@@ -742,7 +742,7 @@ with tab_analytics:
 
             # 5. DURATION IMPACT
             if dur_col and rating_col:
-                st.markdown("### ⏱️ Duration vs. Rating Impact")
+                st.markdown("### ⏱️ Session Duration Impact on Rating")
                 hover_cols = [title_col] if title_col else []
                 fig_s = px.scatter(df, x=dur_col, y=rating_col, color=type_col if type_col else None, 
                                    hover_name=title_col if title_col else None,
