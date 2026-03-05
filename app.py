@@ -16,6 +16,11 @@ import time
 SHEET_ID = "1jYRJe9APAlIZdMQ9svuOo9gR1DbYfrCUjThvtO1DXcI"
 DRIVE_FOLDER_ID = "0ADZkkxHLwZa9Uk9PVA"  # Shared Drive ID
 
+# ─── COLOR PALETTE ───
+COLOR_LIVE = "#2E86C1"      # Royal Blue
+COLOR_SIMULIVE = "#E67E22"  # Sunset Orange
+COLOR_MAP = {"Live": COLOR_LIVE, "Simulive": COLOR_SIMULIVE}
+
 st.set_page_config(page_title="Session Command Center", page_icon="🚀", layout="wide")
 
 # ─── PREMIUM UI STYLING ───
@@ -101,7 +106,6 @@ def upload_to_drive_robust(file_objs, folder_name, date_str, status_container, p
                 progress_val = int(((i + 1) / total_files) * 100)
                 progress_bar.progress(progress_val)
             
-            # Buffer the file safely
             f.seek(0)
             file_data = f.read()
             buffer = io.BytesIO(file_data)
@@ -327,7 +331,7 @@ def analyze_dynamic_columns(df):
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
-tab_upload, tab_list, tab_analytics = st.tabs(["📤 Ops Command Center", "🔍 Session Registry", "📊 Executive Dashboard"])
+tab_upload, tab_list, tab_analytics = st.tabs(["📤 Upload Center", "🔍 Sessions History", "📊 Analysis"])
 
 # ==========================================
 # TAB 1: OPS COMMAND CENTER
@@ -337,26 +341,26 @@ with tab_upload:
 
     with st.sidebar:
         st.header("1. Ops Details")
-        uploader_name = st.text_input("Enter Your Name *", placeholder="e.g. Aryan")
+        uploader_name = st.text_input("Enter Your Full Name *", placeholder="e.g. Yasin Kaif")
         
         st.divider()
-        st.header("2. Session Data")
+        st.header("2. Session Zoom Exports")
         attendee_file = st.file_uploader("Attendee CSV", type=["csv"], key=f"att_{st.session_state.upload_key}")
         poll_files = st.file_uploader("Poll CSV(s)", type=["csv"], accept_multiple_files=True, key=f"poll_{st.session_state.upload_key}")
         
         st.divider()
-        st.header("3. Assets & Links")
+        st.header("3. Additional Files/Resources")
         asset_files = st.file_uploader("Files (PDF, Chat Log)", accept_multiple_files=True, key=f"asset_{st.session_state.upload_key}")
         if asset_files:
             st.caption(f"✅ {len(asset_files)} file(s) attached")
             
-        session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links here...", height=100)
+        session_links = st.text_area("Important Links (Docs, Recordings)", placeholder="Paste links, text etc here...", height=100)
         
         st.divider()
         btn_disabled = not (uploader_name and attendee_file)
         save_btn = st.button("💾 Save All Data", type="primary", use_container_width=True, disabled=btn_disabled)
         if btn_disabled:
-            st.caption("⚠️ Enter Name & Upload Attendee CSV to enable Save.")
+            st.caption("⚠️ Enter Name, & Upload Attendee and Poll CSVs to enable Save.")
 
     if poll_files and attendee_file:
         stats = parse_attendee_smart(attendee_file)
@@ -394,19 +398,13 @@ with tab_upload:
         final_json_dist = "{}"
         total_responses = 0
         
-        if analyzed_polls := []:
-            pass
-        # Correctly process polls for display and saving
         analyzed_polls = []
         if all_polls:
             df_merged = pd.concat(all_polls, ignore_index=True)
-            # Analyze each poll file separately for the "Preview" charts
             for p_df in all_polls:
                 analyzed_polls.append(analyze_dynamic_columns(p_df))
             
-            # Analyze the merged data for the "Official" Sheet stats
             merged_analysis = analyze_dynamic_columns(df_merged)
-            
             ov_key = next((k for k in merged_analysis["ratings"] if "overall" in k.lower()), None)
             tr_key = next((k for k in merged_analysis["ratings"] if "trainer" in k.lower()), None)
             
@@ -449,7 +447,7 @@ with tab_upload:
                             st.caption(f"{q} \n *{t_str}*")
                             fig_bar = px.bar(m["dist"], x="Rating", y="Count", text="Count", template="plotly_white")
                             fig_bar.update_layout(height=200, margin=dict(l=0, r=0, t=0, b=0))
-                            fig_bar.update_traces(marker_color="#3498db") # Blue
+                            fig_bar.update_traces(marker_color=COLOR_LIVE) # Blue
                             st.plotly_chart(fig_bar, use_container_width=True)
                     st.divider()
 
@@ -499,7 +497,7 @@ with tab_upload:
 # TAB 2: INTERACTIVE HISTORY
 # ==========================================
 with tab_list:
-    st.header("🔍 Recent Sessions Registry")
+    st.header("🔍 Recent Sessions History")
     if st.button("🔄 Refresh List", type="primary"): st.session_state.pop('hist_df', None)
     
     if 'hist_df' not in st.session_state or st.session_state.hist_df.empty:
@@ -546,7 +544,6 @@ with tab_list:
                 st.markdown(f"## 📄 {row[title_col]}")
                 st.caption(f"📅 {row[date_col].date()} | 👤 {row[trainer_col]} | 🎓 {row[batch_col]}")
                 
-                # Fetch row data safely
                 peak = row[peak_col] if peak_col else 0
                 end = row[end_col] if end_col else 0
                 ov_rate = row[rating_col] if rating_col else 0
@@ -593,28 +590,39 @@ with tab_list:
                                 vals = d_data["Overall"]
                                 df_d = pd.DataFrame(list(vals.items()), columns=['Rating', 'Count'])
                                 fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="Overall", template="plotly_white")
-                                fig_bar.update_traces(marker_color="#3498db") # Blue
+                                fig_bar.update_traces(marker_color=COLOR_LIVE) # Blue
                                 st.plotly_chart(fig_bar, use_container_width=True)
                         with rc2:
                             if "Trainer" in d_data:
                                 vals = d_data["Trainer"]
                                 df_d = pd.DataFrame(list(vals.items()), columns=['Rating', 'Count'])
                                 fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="Trainer", template="plotly_white")
-                                fig_bar.update_traces(marker_color="#2ecc71") # Green
+                                fig_bar.update_traces(marker_color=COLOR_SIMULIVE) # Orange
                                 st.plotly_chart(fig_bar, use_container_width=True)
                         with rc3:
-                            if "NPS" in d_data:
-                                vals = d_data["NPS"]
-                                df_d = pd.DataFrame(list(vals.items()), columns=['Category', 'Count'])
-                                fig_pie = px.pie(df_d, values='Count', names='Category', title="NPS", template="plotly_white", hole=0.4)
-                                st.plotly_chart(fig_pie, use_container_width=True)
-                    except: st.caption("Error parsing details.")
+                            # Robust NPS Key Finder
+                            nps_key = next((k for k in d_data.keys() if "recommend" in k.lower() or "nps" in k.lower() or "friend" in k.lower()), None)
+                            
+                            if nps_key: 
+                                if nps_key == "NPS": 
+                                    vals = d_data[nps_key]
+                                    df_d = pd.DataFrame(list(vals.items()), columns=['Category', 'Count'])
+                                    fig_pie = px.pie(df_d, values='Count', names='Category', title="NPS Groups", template="plotly_white", hole=0.4)
+                                    st.plotly_chart(fig_pie, use_container_width=True)
+                                else:
+                                    vals = d_data[nps_key]
+                                    df_d = pd.DataFrame(list(vals.items()), columns=['Rating', 'Count'])
+                                    fig_bar = px.bar(df_d, x="Rating", y="Count", text="Count", title="NPS Distribution", template="plotly_white")
+                                    fig_bar.update_traces(marker_color="#e74c3c")
+                                    st.plotly_chart(fig_bar, use_container_width=True)
+                            else: st.info("No NPS data found.")
+                    except Exception as e: st.caption(f"Error parsing details: {e}")
 
 # ==========================================
 # TAB 3: EXECUTIVE DASHBOARD
 # ==========================================
 with tab_analytics:
-    st.header("📊 Executive Dashboard")
+    st.header("📊 Analysis Dashboard")
     if st.button("🔄 Refresh Analysis"): st.session_state.pop('exec_df', None)
     
     if 'exec_df' not in st.session_state or st.session_state.exec_df.empty:
@@ -630,6 +638,7 @@ with tab_analytics:
         type_col = next((c for c in df.columns if "Type" in c), None)
         dur_col = next((c for c in df.columns if "Duration" in c), None)
         title_col = next((c for c in df.columns if "Title" in c), None)
+        tr_rating_col = next((c for c in df.columns if "Trainer Rating" in c), None)
         
         if date_col:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
@@ -640,7 +649,14 @@ with tab_analytics:
             
             # 1. TRAINER MATRIX
             if trainer_col and rating_col:
-                st.markdown("### 🏆 Trainer Matrix")
+                st.markdown("### 🏆 Trainer Performance")
+                with st.expander("ℹ️ How to read this chart"):
+                    st.caption("""
+                    * **X-Axis (Count):** Number of sessions conducted.
+                    * **Y-Axis (Avg):** Average Overall Rating.
+                    * **Bubble Size:** Volume of feedback received.
+                    * **Color (Star %):** Percentage of sessions where the rating was > 4.6 (High Performance).
+                    """)
                 t_stats = df.groupby(trainer_col).agg(
                     Count=(rating_col,'count'),
                     Avg=(rating_col,'mean'),
@@ -654,9 +670,22 @@ with tab_analytics:
                 st.plotly_chart(fig_bub, use_container_width=True)
             st.divider()
 
-            # 2. WEEKLY PERFORMANCE (Day-Wise Bar Chart)
+            # 2. CHRONOLOGICAL PERFORMANCE (Timeline)
+            if rating_col and tr_rating_col:
+                st.markdown("### 📅 Chronological Performance Trend")
+                chron_perf = df.groupby(date_col)[[rating_col, tr_rating_col]].mean().reset_index()
+                chron_melt = chron_perf.melt(id_vars=date_col, value_vars=[rating_col, tr_rating_col], var_name='Metric', value_name='Rating')
+                
+                fig_trend = px.line(chron_melt, x=date_col, y='Rating', color='Metric', markers=True, 
+                                    template="plotly_white", title="Average Rating per Date")
+                fig_trend.update_traces(line_width=3)
+                st.plotly_chart(fig_trend, use_container_width=True)
+            
+            st.divider()
+
+            # 3. WEEKLY PERFORMANCE (Day-Wise Bar Chart)
             if type_col and rating_col:
-                st.markdown("### 📅 Weekly Performance (Live vs Simulive)")
+                st.markdown("### 🗓️ Weekly Performance (Live vs Simulive)")
                 df['Day'] = df[date_col].dt.day_name()
                 days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 df['Day'] = pd.Categorical(df['Day'], categories=days_order, ordered=True)
@@ -668,22 +697,25 @@ with tab_analytics:
                 
                 fig_day = px.bar(day_stats, x="Day", y="Average", color=type_col, barmode="group", 
                                  text_auto=".2f",
-                                 hover_data=["Sessions"],
-                                 color_discrete_map={"Live": "#00C9A7", "Simulive": "#845EC2"}, # Teal & Purple
+                                 hover_data={"Average": True, "Sessions": True, "Day": False},
+                                 color_discrete_map=COLOR_MAP,
                                  template="plotly_white")
                 fig_day.update_traces(marker_line_width=0)
                 st.plotly_chart(fig_day, use_container_width=True)
             
             st.divider()
 
-            # 3. LIVE vs SIMULIVE & NPS
+            # 4. LIVE vs SIMULIVE & NPS
             st.markdown("### 📊 Distribution & Trends")
+            with st.expander("ℹ️ Understanding Box Plots"):
+                st.caption("The box shows the middle 50% of ratings. The line inside is the median. Dots outside are outliers (unusually high or low ratings).")
+                
             c1, c2 = st.columns([2, 1])
             with c1:
                 if type_col and rating_col:
                     st.markdown("**🔴 Live vs. 🟣 Simulive Distribution**")
                     fig = px.box(df, x=type_col, y=rating_col, color=type_col, points="all", 
-                                 color_discrete_map={"Live": "#00C9A7", "Simulive": "#845EC2"},
+                                 color_discrete_map=COLOR_MAP,
                                  template="plotly_white")
                     st.plotly_chart(fig, use_container_width=True)
             
@@ -697,13 +729,14 @@ with tab_analytics:
                     st.plotly_chart(fig_nps, use_container_width=True)
             st.divider()
 
-            # 4. DURATION IMPACT
+            # 5. DURATION IMPACT
             if dur_col and rating_col:
                 st.markdown("### ⏱️ Duration vs. Rating Impact")
                 hover_cols = [title_col] if title_col else []
                 fig_s = px.scatter(df, x=dur_col, y=rating_col, color=type_col if type_col else None, 
-                                   hover_data=hover_cols,
-                                   color_discrete_map={"Live": "#00C9A7", "Simulive": "#845EC2"},
+                                   hover_name=title_col if title_col else None,
+                                   hover_data=[rating_col, dur_col],
+                                   color_discrete_map=COLOR_MAP,
                                    template="plotly_white", opacity=0.8)
-                fig_s.update_traces(marker=dict(size=12, line=dict(width=1, color='DarkSlateGrey')))
+                fig_s.update_traces(marker=dict(size=14, line=dict(width=1, color='DarkSlateGrey')))
                 st.plotly_chart(fig_s, use_container_width=True)
