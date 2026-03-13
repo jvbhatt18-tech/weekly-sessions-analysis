@@ -432,7 +432,8 @@ with tab_upload:
             st.subheader("📉 Retention Curve Preview")
             fig = px.area(stats["timeline"], x="Time", y="Attendees", template="plotly_white")
             if cutoff_dt:
-                fig.add_vline(x=cutoff_dt, line_dash="dash", line_color="red", annotation_text="QnA/Project Start")
+                fig.add_vline(x=cutoff_dt, line_dash="dash", line_color="red")
+                fig.add_annotation(x=cutoff_dt, y=1, yref="paper", text="QnA/Project Start", showarrow=False, font=dict(color="red"))
             fig.update_traces(line_color="#9b59b6", fillcolor="rgba(155, 89, 182, 0.2)", line_shape="spline")
             st.plotly_chart(fig, use_container_width=True)
         
