@@ -370,24 +370,52 @@ with tab_upload:
         end_count_10 = 0
         end_count_30 = 0
         timeline_df = stats["timeline"]
+        segment_scores = {}  # stores retention info per phase
+        qna_dt = datetime.combine(session_date, qna_start) if qna_start else None
+        proj_dt = datetime.combine(session_date, proj_start) if proj_start else None
+
         if not timeline_df.empty:
+            # Determine cutoff for legacy stickiness (earliest of the two)
             cutoff_dt = None
-            if qna_start or proj_start:
-                times = []
-                if qna_start: times.append(qna_start)
-                if proj_start: times.append(proj_start)
-                earliest_cutoff = min(times)
-                cutoff_dt = datetime.combine(session_date, earliest_cutoff)
+            if qna_dt or proj_dt:
+                cutoff_dt = min(filter(None, [qna_dt, proj_dt]))
                 valid_timeline = timeline_df[timeline_df["Time"] < cutoff_dt]
-                if valid_timeline.empty: valid_timeline = timeline_df 
+                if valid_timeline.empty: valid_timeline = timeline_df
             else:
                 valid_timeline = timeline_df
-            
+
             if not valid_timeline.empty:
                 end_10 = valid_timeline.iloc[-10:] if len(valid_timeline) >= 10 else valid_timeline
                 end_count_10 = end_10["Attendees"].mean()
                 end_30 = valid_timeline.iloc[-30:] if len(valid_timeline) >= 30 else valid_timeline
                 end_count_30 = end_30["Attendees"].mean()
+
+            # Build segmented retention scores
+            if qna_dt and proj_dt:
+                first_dt, second_dt = (min(qna_dt, proj_dt), max(qna_dt, proj_dt))
+                first_label = "Project Start" if proj_dt <= qna_dt else "QnA Start"
+                second_label = "QnA Start" if proj_dt <= qna_dt else "Project Start"
+
+                seg_teaching = timeline_df[timeline_df["Time"] < first_dt]
+                seg_middle = timeline_df[(timeline_df["Time"] >= first_dt) & (timeline_df["Time"] < second_dt)]
+                seg_after = timeline_df[timeline_df["Time"] >= second_dt]
+
+                for label, seg in [("Teaching", seg_teaching), (first_label, seg_middle), (second_label, seg_after)]:
+                    if not seg.empty:
+                        avg_att = seg["Attendees"].mean()
+                        segment_scores[label] = {"avg": round(avg_att), "stickiness": round(avg_att / peak_val * 100) if peak_val > 0 else 0}
+            elif qna_dt or proj_dt:
+                only_dt = qna_dt or proj_dt
+                only_label = "QnA" if qna_dt else "Project"
+                seg_before = timeline_df[timeline_df["Time"] < only_dt]
+                seg_after = timeline_df[timeline_df["Time"] >= only_dt]
+
+                if not seg_before.empty:
+                    avg_b = seg_before["Attendees"].mean()
+                    segment_scores["Teaching"] = {"avg": round(avg_b), "stickiness": round(avg_b / peak_val * 100) if peak_val > 0 else 0}
+                if not seg_after.empty:
+                    avg_a = seg_after["Attendees"].mean()
+                    segment_scores[f"{only_label}"] = {"avg": round(avg_a), "stickiness": round(avg_a / peak_val * 100) if peak_val > 0 else 0}
 
         analyzed_polls = []
         for p in poll_files:
@@ -427,13 +455,28 @@ with tab_upload:
         m3.metric("Overall Rating", final_ov_val)
         m4.metric("Trainer Rating", final_tr_val)
         m5.metric("NPS", final_nps_val)
+
+        if segment_scores:
+            st.markdown("#### 📊 Phase-wise Retention Breakdown")
+            seg_cols = st.columns(len(segment_scores))
+            phase_colors = {"Teaching": "#2c3e50", "QnA Start": "#e74c3c", "QnA": "#e74c3c", "Project Start": "#2E86C1", "Project": "#2E86C1"}
+            for i, (phase, data) in enumerate(segment_scores.items()):
+                color = phase_colors.get(phase, "#7f8c8d")
+                seg_cols[i].markdown(f"""<div style="background:{color}; color:white; border-radius:12px; padding:15px; text-align:center; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+                    <div style="font-size:0.8rem; text-transform:uppercase; letter-spacing:1px; opacity:0.9;">{phase}</div>
+                    <div style="font-size:1.8rem; font-weight:800;">{data['stickiness']}%</div>
+                    <div style="font-size:0.75rem; opacity:0.8;">Avg: {data['avg']} attendees</div>
+                </div>""", unsafe_allow_html=True)
         
         if stats["timeline"] is not None and not stats["timeline"].empty:
             st.subheader("📉 Retention Curve Preview")
             fig = px.area(stats["timeline"], x="Time", y="Attendees", template="plotly_white")
-            if cutoff_dt:
-                fig.add_vline(x=cutoff_dt, line_dash="dash", line_color="red")
-                fig.add_annotation(x=cutoff_dt, y=1, yref="paper", text="QnA/Project Start", showarrow=False, font=dict(color="red"))
+            if qna_dt:
+                fig.add_vline(x=qna_dt, line_dash="dash", line_color="red")
+                fig.add_annotation(x=qna_dt, y=1, yref="paper", text="QnA Start", showarrow=False, font=dict(color="red"), yshift=10)
+            if proj_dt:
+                fig.add_vline(x=proj_dt, line_dash="dash", line_color="#2E86C1")
+                fig.add_annotation(x=proj_dt, y=1, yref="paper", text="Project Start", showarrow=False, font=dict(color="#2E86C1"), yshift=-10)
             fig.update_traces(line_color="#9b59b6", fillcolor="rgba(155, 89, 182, 0.2)", line_shape="spline")
             st.plotly_chart(fig, use_container_width=True)
         
@@ -470,7 +513,8 @@ with tab_upload:
                             qna_str = qna_start.strftime("%H:%M") if qna_start else ""
                             proj_str = proj_start.strftime("%H:%M") if proj_start else ""
                             
-                            row = [date_str, trainer, title, batch, duration_val, peak_val, unique_val, int(end_count_10), f"{trainer_score:.2f}", final_ov_val, final_tr_val, total_responses, final_nps_val, session_type, stats["curve_str"], final_json_dist, uploader_name, int(stickiness_30*100), qna_str, proj_str]
+                            segment_json = json.dumps(segment_scores) if segment_scores else ""
+                            row = [date_str, trainer, title, batch, duration_val, peak_val, unique_val, int(end_count_10), f"{trainer_score:.2f}", final_ov_val, final_tr_val, total_responses, final_nps_val, session_type, stats["curve_str"], final_json_dist, uploader_name, int(stickiness_30*100), qna_str, proj_str, segment_json]
                             ws.append_row(row, value_input_option="USER_ENTERED")
                             status.write("✅ Sheet Updated!")
                             
@@ -610,7 +654,26 @@ with tab_list:
                 m3.metric("Peak", peak)
                 m4.metric("Duration", mins_to_hhmm(duration_mins))
                 m5.metric("End Count", end)
-                
+
+                # Phase-wise retention from saved data (column index 20)
+                if len(row) > 20:
+                    try:
+                        seg_raw = row.iloc[20]
+                        if seg_raw and str(seg_raw).strip() and str(seg_raw).strip() != "":
+                            hist_segments = json.loads(str(seg_raw))
+                            if hist_segments:
+                                st.markdown("#### 📊 Phase-wise Retention Breakdown")
+                                h_seg_cols = st.columns(len(hist_segments))
+                                h_phase_colors = {"Teaching": "#2c3e50", "QnA Start": "#e74c3c", "QnA": "#e74c3c", "Project Start": "#2E86C1", "Project": "#2E86C1"}
+                                for i, (phase, data) in enumerate(hist_segments.items()):
+                                    color = h_phase_colors.get(phase, "#7f8c8d")
+                                    h_seg_cols[i].markdown(f"""<div style="background:{color}; color:white; border-radius:12px; padding:15px; text-align:center; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+                                        <div style="font-size:0.8rem; text-transform:uppercase; letter-spacing:1px; opacity:0.9;">{phase}</div>
+                                        <div style="font-size:1.8rem; font-weight:800;">{data['stickiness']}%</div>
+                                        <div style="font-size:0.75rem; opacity:0.8;">Avg: {data['avg']} attendees</div>
+                                    </div>""", unsafe_allow_html=True)
+                    except: pass
+
                 st.divider()
                 st.subheader("📉 Retention Curve")
                 curve_data = str(row[curve_col]) if curve_col else ""
